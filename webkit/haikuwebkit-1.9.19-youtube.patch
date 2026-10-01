@@ -1,0 +1,3338 @@
+diff -ruN orig/haikuwebkit/Source/WebCore/PlatformHaiku.cmake haikuwebkit/Source/WebCore/PlatformHaiku.cmake
+--- orig/haikuwebkit/Source/WebCore/PlatformHaiku.cmake
++++ haikuwebkit/Source/WebCore/PlatformHaiku.cmake
+@@ -129,7 +129,11 @@
+   platform/graphics/haiku/IntPointHaiku.cpp
+   platform/graphics/haiku/IntRectHaiku.cpp
+   platform/graphics/haiku/IntSizeHaiku.cpp
++  platform/graphics/haiku/HLSMediaIOHaiku.cpp
+   platform/graphics/haiku/MediaPlayerPrivateHaiku.cpp
++  platform/graphics/haiku/MediaPlayerPrivateHaikuMSE.cpp
++  platform/graphics/haiku/MediaSourcePrivateHaiku.cpp
++  platform/graphics/haiku/SourceBufferPrivateHaiku.cpp
+   platform/graphics/haiku/NativeImageHaiku.cpp
+   platform/graphics/haiku/PathHaiku.cpp
+   platform/graphics/haiku/ShareableBitmapHaiku.cpp
+@@ -197,6 +201,9 @@
+   ${WEBP_INCLUDE_DIRS}
+   ${ZLIB_INCLUDE_DIRS}
+   /system/develop/headers/private/netservices
++  # BAdapterIO, for HLSMediaIOHaiku
++  /system/develop/headers/private/media/experimental
++  /system/develop/headers/private/shared
+ )
+ 
+ if (ENABLE_WEB_AUDIO)
+diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/MediaPlayer.cpp haikuwebkit/Source/WebCore/platform/graphics/MediaPlayer.cpp
+--- orig/haikuwebkit/Source/WebCore/platform/graphics/MediaPlayer.cpp
++++ haikuwebkit/Source/WebCore/platform/graphics/MediaPlayer.cpp
+@@ -103,6 +103,9 @@
+ #if PLATFORM(HAIKU)
+ #include "MediaPlayerPrivateHaiku.h"
+ #define PlatformMediaEngineClassName MediaPlayerPrivate
++#if ENABLE(MEDIA_SOURCE)
++#include "MediaPlayerPrivateHaikuMSE.h"
++#endif
+ #endif
+ 
+ #if USE(EXTERNAL_HOLEPUNCH)
+@@ -352,6 +355,18 @@
+     MediaPlayerPrivateHolePunch::registerMediaEngine(addMediaEngine);
+ #endif
+ 
++#if PLATFORM(HAIKU)
++    // The Haiku engine (MediaPlayerPrivateHaiku, which plays through the
++    // Media Kit) was never registered: PlatformMediaEngineClassName is
++    // defined above and used nowhere, so installedMediaEngines() was empty
++    // and every canPlayType() answered "". No HTML5 audio or video played.
++    PlatformMediaEngineClassName::registerMediaEngine(addMediaEngine);
++#if ENABLE(MEDIA_SOURCE)
++    // Media Source Extensions: fMP4 H.264/AAC through the Media Kit.
++    MediaPlayerPrivateHaikuMSE::registerMediaEngine(addMediaEngine);
++#endif
++#endif
++
+     haveMediaEnginesVector() = true;
+ }
+ 
+diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/MediaPlayer.h haikuwebkit/Source/WebCore/platform/graphics/MediaPlayer.h
+--- orig/haikuwebkit/Source/WebCore/platform/graphics/MediaPlayer.h
++++ haikuwebkit/Source/WebCore/platform/graphics/MediaPlayer.h
+@@ -154,7 +154,8 @@
+     Mock,
+     AVFObjC,
+     GStreamer,
+-    Remote
++    Remote,
++    Haiku
+ };
+ 
+ enum class MediaPlayerType {
+@@ -170,7 +171,8 @@
+     GStreamerMSE,
+     HolePunch,
+     Remote,
+-    Haiku
++    Haiku,
++    HaikuMSE
+ };
+ 
+ using TrackID = uint64_t;
+diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/MediaPlayerEnums.h haikuwebkit/Source/WebCore/platform/graphics/MediaPlayerEnums.h
+--- orig/haikuwebkit/Source/WebCore/platform/graphics/MediaPlayerEnums.h
++++ haikuwebkit/Source/WebCore/platform/graphics/MediaPlayerEnums.h
+@@ -91,7 +91,8 @@
+     MediaFoundation,
+     MockMSE,
+     CocoaWebM,
+-    Haiku
++    Haiku,
++    HaikuMSE
+ };
+ 
+ enum class MediaPlayerWirelessPlaybackTargetType : uint8_t {
+diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/HLSMediaIOHaiku.cpp haikuwebkit/Source/WebCore/platform/graphics/haiku/HLSMediaIOHaiku.cpp
+--- orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/HLSMediaIOHaiku.cpp	1970-01-01 00:00:00.000000000 +0000
++++ haikuwebkit/Source/WebCore/platform/graphics/haiku/HLSMediaIOHaiku.cpp
+@@ -0,0 +1,407 @@
++/*
++ * Copyright (C) 2026 rainygirl
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Library General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ */
++
++#include "config.h"
++#include "HLSMediaIOHaiku.h"
++
++#if ENABLE(VIDEO)
++
++#include <curl/curl.h>
++#include <MediaDefs.h>
++#include <Url.h>
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <strings.h>
++#include <vector>
++
++namespace WebCore {
++
++static bool hlsDebug()
++{
++    static const bool debug = getenv("WEBKIT_MEDIA_DEBUG") != nullptr;
++    return debug;
++}
++
++#define HLS_LOG(...) do { if (hlsDebug()) fprintf(stderr, "[HLS] " __VA_ARGS__); } while (0)
++
++// How long a read may wait for the next segment before the reader is told
++// the stream ended. A live segment is a few seconds; a stall longer than this
++// is a dead stream.
++static const bigtime_t kReadTimeout = 30000000;
++
++// Data the reader has passed is dropped once this much has accumulated, so a
++// live stream that plays for hours does not grow the buffer for hours.
++static const off_t kKeepBehind = 2 * 1024 * 1024;
++static const off_t kFlushEvery = 8 * 1024 * 1024;
++
++HLSMediaIO::HLSMediaIO(const char* url, const char* userAgent)
++    : BAdapterIO(B_MEDIA_STREAMING | B_MEDIA_MUTABLE_SIZE, kReadTimeout)
++    , m_url(url)
++    , m_userAgent(userAgent)
++{
++}
++
++HLSMediaIO::~HLSMediaIO()
++{
++    m_quit = true;
++    if (m_thread >= 0) {
++        status_t result;
++        wait_for_thread(m_thread, &result);
++    }
++}
++
++bool HLSMediaIO::IsHLSURL(const char* url)
++{
++    if (!url)
++        return false;
++    // Strip the query: a playlist URL ends in .m3u8 before it, and YouTube's
++    // manifest URLs carry the format in the path instead.
++    const char* query = strchr(url, '?');
++    size_t length = query ? (size_t)(query - url) : strlen(url);
++    if (length >= 5 && !strncasecmp(url + length - 5, ".m3u8", 5))
++        return true;
++    if (strstr(url, "/api/manifest/hls_variant/") || strstr(url, "/api/manifest/hls_playlist/"))
++        return true;
++    return false;
++}
++
++status_t HLSMediaIO::Open()
++{
++    m_input = BuildInputAdapter();
++    m_running = true;
++    m_thread = spawn_thread(FetchThread, "HLS fetch", B_NORMAL_PRIORITY, this);
++    if (m_thread < 0)
++        return m_thread;
++    resume_thread(m_thread);
++    return BAdapterIO::Open();
++}
++
++bool HLSMediaIO::IsRunning() const
++{
++    return m_running;
++}
++
++status_t HLSMediaIO::SeekRequested(off_t)
++{
++    // A live stream cannot go back further than what is buffered.
++    return B_NOT_SUPPORTED;
++}
++
++status_t HLSMediaIO::FetchThread(void* cookie)
++{
++    static_cast<HLSMediaIO*>(cookie)->Fetch();
++    return B_OK;
++}
++
++namespace {
++
++struct TextSink {
++    BString* out;
++    volatile bool* quit;
++};
++
++size_t writeText(char* data, size_t size, size_t count, void* cookie)
++{
++    TextSink* sink = static_cast<TextSink*>(cookie);
++    if (*sink->quit)
++        return 0;
++    sink->out->Append(data, size * count);
++    return size * count;
++}
++
++struct SegmentSink {
++    BInputAdapter* input;
++    volatile bool* quit;
++    off_t* written;
++};
++
++size_t writeSegment(char* data, size_t size, size_t count, void* cookie)
++{
++    SegmentSink* sink = static_cast<SegmentSink*>(cookie);
++    if (*sink->quit)
++        return 0;
++    ssize_t result = sink->input->Write(data, size * count);
++    if (result < 0)
++        return 0;
++    *sink->written += result;
++    return size * count;
++}
++
++int abortIfQuit(void* cookie, curl_off_t, curl_off_t, curl_off_t, curl_off_t)
++{
++    return *static_cast<volatile bool*>(cookie) ? 1 : 0;
++}
++
++BString resolve(const BString& base, const BString& reference)
++{
++    if (reference.FindFirst("://") >= 0)
++        return reference;
++    BUrl url(BUrl(base.String(), true), reference);
++    return url.UrlString();
++}
++
++// The value of NAME= in an #EXT-X-... attribute list, or "" if absent.
++BString attribute(const BString& line, const char* name)
++{
++    BString key(name);
++    key << "=";
++    int32 start = line.FindFirst(key);
++    while (start > 0 && line[start - 1] != ':' && line[start - 1] != ',')
++        start = line.FindFirst(key, start + 1);
++    if (start < 0)
++        return BString();
++    start += key.Length();
++    BString value;
++    if (line[start] == '"') {
++        int32 end = line.FindFirst('"', start + 1);
++        line.CopyInto(value, start + 1, (end < 0 ? line.Length() : end) - start - 1);
++    } else {
++        int32 end = line.FindFirst(',', start);
++        line.CopyInto(value, start, (end < 0 ? line.Length() : end) - start);
++    }
++    return value;
++}
++
++void configure(CURL* curl, const BString& url, const BString& userAgent, volatile bool* quit)
++{
++    curl_easy_setopt(curl, CURLOPT_URL, url.String());
++    curl_easy_setopt(curl, CURLOPT_USERAGENT, userAgent.String());
++    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
++    curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
++    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
++    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
++    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
++    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 20L);
++    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
++    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, abortIfQuit);
++    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, (void*)quit);
++}
++
++} // namespace
++
++bool HLSMediaIO::FetchText(const BString& url, BString& out)
++{
++    if (!m_playlistCurl)
++        m_playlistCurl = curl_easy_init();
++    CURL* curl = static_cast<CURL*>(m_playlistCurl);
++    if (!curl)
++        return false;
++    out.Truncate(0);
++    TextSink sink { &out, &m_quit };
++    configure(curl, url, m_userAgent, &m_quit);
++    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeText);
++    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &sink);
++    CURLcode code = curl_easy_perform(curl);
++    long status = 0;
++    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
++    if (code != CURLE_OK)
++        HLS_LOG("playlist failed: %s (HTTP %ld)\n", curl_easy_strerror(code), status);
++    return code == CURLE_OK;
++}
++
++bool HLSMediaIO::FetchSegment(const BString& url)
++{
++    if (!m_segmentCurl)
++        m_segmentCurl = curl_easy_init();
++    CURL* curl = static_cast<CURL*>(m_segmentCurl);
++    if (!curl)
++        return false;
++    SegmentSink sink { m_input, &m_quit, &m_written };
++    configure(curl, url, m_userAgent, &m_quit);
++    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeSegment);
++    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &sink);
++    bigtime_t start = system_time();
++    off_t before = m_written;
++    CURLcode code = curl_easy_perform(curl);
++    long status = 0;
++    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
++    if (code != CURLE_OK)
++        HLS_LOG("segment failed: %s (HTTP %ld)\n", curl_easy_strerror(code), status);
++    else {
++        HLS_LOG("segment %lld bytes in %.2f s\n", (long long)(m_written - before),
++            (system_time() - start) / 1e6);
++    }
++    return code == CURLE_OK;
++}
++
++// The variant to play: the tallest at or below WEBPOSITIVE_HLS_MAX_HEIGHT
++// (360 by default -- what a 1.33 GHz Atom draws comfortably), else the
++// smallest there is.
++BString HLSMediaIO::ChooseVariant(const BString& master, const BString& masterURL)
++{
++    int maxHeight = 360;
++    if (const char* env = getenv("WEBPOSITIVE_HLS_MAX_HEIGHT"))
++        maxHeight = atoi(env) > 0 ? atoi(env) : maxHeight;
++
++    BString best, smallest;
++    int bestHeight = -1, smallestHeight = 1 << 30;
++    long bestBandwidth = -1;
++
++    BString line, pendingInfo;
++    int32 position = 0;
++    while (position < master.Length()) {
++        int32 end = master.FindFirst('\n', position);
++        if (end < 0)
++            end = master.Length();
++        master.CopyInto(line, position, end - position);
++        line.RemoveAll("\r");
++        position = end + 1;
++
++        if (line.StartsWith("#EXT-X-STREAM-INF:")) {
++            pendingInfo = line;
++            continue;
++        }
++        if (line.IsEmpty() || line[0] == '#' || pendingInfo.IsEmpty())
++            continue;
++
++        BString resolution = attribute(pendingInfo, "RESOLUTION");
++        int height = 0;
++        int32 x = resolution.FindFirst('x');
++        if (x >= 0)
++            height = atoi(resolution.String() + x + 1);
++        long bandwidth = atol(attribute(pendingInfo, "BANDWIDTH").String());
++        BString uri = resolve(masterURL, line);
++        pendingInfo.Truncate(0);
++
++        if (height < smallestHeight) {
++            smallestHeight = height;
++            smallest = uri;
++        }
++        if (height <= maxHeight && (height > bestHeight
++            || (height == bestHeight && bandwidth > bestBandwidth))) {
++            bestHeight = height;
++            bestBandwidth = bandwidth;
++            best = uri;
++        }
++    }
++    if (best.IsEmpty()) {
++        HLS_LOG("no variant at or below %dp, taking %dp\n", maxHeight, smallestHeight);
++        return smallest;
++    }
++    HLS_LOG("variant %dp, %ld bit/s\n", bestHeight, bestBandwidth);
++    return best;
++}
++
++void HLSMediaIO::Fetch()
++{
++    FetchStream();
++    if (m_playlistCurl)
++        curl_easy_cleanup(static_cast<CURL*>(m_playlistCurl));
++    if (m_segmentCurl)
++        curl_easy_cleanup(static_cast<CURL*>(m_segmentCurl));
++    m_playlistCurl = m_segmentCurl = nullptr;
++    m_running = false;
++}
++
++void HLSMediaIO::FetchStream()
++{
++    BString playlist;
++    if (!FetchText(m_url, playlist)) {
++        m_running = false;
++        return;
++    }
++
++    BString mediaURL = m_url;
++    if (playlist.FindFirst("#EXT-X-STREAM-INF:") >= 0) {
++        mediaURL = ChooseVariant(playlist, m_url);
++        if (mediaURL.IsEmpty() || !FetchText(mediaURL, playlist)) {
++            m_running = false;
++            return;
++        }
++    }
++
++    long long lastSequence = -1;
++    BString initURL;
++    bool first = true;
++    off_t flushedAt = 0;
++
++    while (!m_quit) {
++        long long sequence = 0;
++        double targetDuration = 5;
++        bool endList = false;
++        BString map;
++
++        struct Entry { long long sequence; BString url; };
++        std::vector<Entry> entries;
++
++        BString line;
++        int32 position = 0;
++        bool haveInfo = false;
++        while (position < playlist.Length()) {
++            int32 end = playlist.FindFirst('\n', position);
++            if (end < 0)
++                end = playlist.Length();
++            playlist.CopyInto(line, position, end - position);
++            line.RemoveAll("\r");
++            position = end + 1;
++
++            if (line.StartsWith("#EXT-X-MEDIA-SEQUENCE:"))
++                sequence = atoll(line.String() + 22);
++            else if (line.StartsWith("#EXT-X-TARGETDURATION:"))
++                targetDuration = atof(line.String() + 22);
++            else if (line.StartsWith("#EXT-X-ENDLIST"))
++                endList = true;
++            else if (line.StartsWith("#EXT-X-MAP:"))
++                map = resolve(mediaURL, attribute(line, "URI"));
++            else if (line.StartsWith("#EXTINF:"))
++                haveInfo = true;
++            else if (!line.IsEmpty() && line[0] != '#' && haveInfo) {
++                entries.push_back(Entry { sequence++, resolve(mediaURL, line) });
++                haveInfo = false;
++            }
++        }
++
++        m_live = !endList;
++
++        if (first) {
++            HLS_LOG("%s playlist, %d segments, target %.1f s\n",
++                endList ? "VOD" : "live", (int)entries.size(), targetDuration);
++            // Start a live stream three segments from its edge, as players do.
++            if (!endList && entries.size() > 3)
++                lastSequence = entries[entries.size() - 4].sequence;
++            first = false;
++        }
++
++        if (!map.IsEmpty() && map != initURL) {
++            initURL = map;
++            FetchSegment(initURL);
++        }
++
++        for (size_t i = 0; i < entries.size() && !m_quit; i++) {
++            const Entry& entry = entries[i];
++            if (entry.sequence <= lastSequence)
++                continue;
++            FetchSegment(entry.url);
++            lastSequence = entry.sequence;
++
++            off_t reader = Position();
++            if (reader - flushedAt > kFlushEvery && reader > kKeepBehind) {
++                FlushBefore(reader - kKeepBehind);
++                flushedAt = reader;
++            }
++        }
++
++        if (endList || m_quit)
++            break;
++
++        // Ask again after half a target duration, in steps short enough for
++        // the destructor not to wait on a sleeping thread.
++        bigtime_t wake = system_time() + (bigtime_t)(targetDuration * 500000);
++        while (!m_quit && system_time() < wake)
++            snooze(100000);
++        if (!m_quit && !FetchText(mediaURL, playlist))
++            snooze(1000000);
++    }
++}
++
++} // namespace WebCore
++
++#endif
+diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/HLSMediaIOHaiku.h haikuwebkit/Source/WebCore/platform/graphics/haiku/HLSMediaIOHaiku.h
+--- orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/HLSMediaIOHaiku.h	1970-01-01 00:00:00.000000000 +0000
++++ haikuwebkit/Source/WebCore/platform/graphics/haiku/HLSMediaIOHaiku.h
+@@ -0,0 +1,67 @@
++/*
++ * Copyright (C) 2026 rainygirl
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Library General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ */
++
++#pragma once
++
++#if ENABLE(VIDEO)
++
++#include <AdapterIO.h>
++#include <OS.h>
++#include <String.h>
++
++namespace WebCore {
++
++// HTTP Live Streaming for the Haiku media engine. The Media Kit has no HLS
++// reader, so this does what Safari's AVFoundation does underneath: read the
++// playlist, pick a variant, and fetch its segments one after another. The
++// segments (MPEG-TS, or fMP4 after an EXT-X-MAP) are concatenated into one
++// stream the Media Kit's ffmpeg reader demuxes like any other file. A live
++// playlist is fetched again every half target duration for new segments.
++class HLSMediaIO final : public BAdapterIO {
++public:
++    explicit HLSMediaIO(const char* url, const char* userAgent);
++    ~HLSMediaIO();
++
++    status_t Open() override;
++    bool IsRunning() const override;
++
++    bool IsLive() const { return m_live; }
++
++    static bool IsHLSURL(const char* url);
++
++protected:
++    status_t SeekRequested(off_t position) override;
++
++private:
++    static status_t FetchThread(void*);
++    void Fetch();
++    void FetchStream();
++    bool FetchText(const BString& url, BString& out);
++    bool FetchSegment(const BString& url);
++    BString ChooseVariant(const BString& master, const BString& masterURL);
++
++    // One handle each for playlists and segments, kept for the whole stream:
++    // a handle keeps its connection, and a fresh TLS handshake for every
++    // five-second segment was a tenth of the Atom.
++    void* m_playlistCurl { nullptr };
++    void* m_segmentCurl { nullptr };
++
++    BString m_url;
++    BString m_userAgent;
++    BInputAdapter* m_input { nullptr };
++    thread_id m_thread { -1 };
++    volatile bool m_quit { false };
++    volatile bool m_running { false };
++    volatile bool m_live { false };
++    off_t m_written { 0 };
++};
++
++} // namespace WebCore
++
++#endif
+diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/HaikuMSESample.h haikuwebkit/Source/WebCore/platform/graphics/haiku/HaikuMSESample.h
+--- orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/HaikuMSESample.h	1970-01-01 00:00:00.000000000 +0000
++++ haikuwebkit/Source/WebCore/platform/graphics/haiku/HaikuMSESample.h
+@@ -0,0 +1,136 @@
++/*
++ * Copyright (C) 2026 rainygirl
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Library General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ */
++
++#pragma once
++
++#if ENABLE(MEDIA_SOURCE)
++
++#include "FloatSize.h"
++#include "MediaSample.h"
++#include <wtf/MediaTime.h>
++#include <wtf/ThreadSafeRefCounted.h>
++#include <wtf/Vector.h>
++#include <wtf/text/WTFString.h>
++
++namespace WebCore {
++
++// What a track's sample entry in the initialization segment says, as much
++// of it as a Media Kit decoder needs: the codec, its configuration record
++// (avcC for H.264, the AudioSpecificConfig for AAC) and the raw format.
++class HaikuTrackConfig final : public ThreadSafeRefCounted<HaikuTrackConfig> {
++public:
++    enum class Kind : uint8_t { Video, Audio };
++
++    static Ref<HaikuTrackConfig> create() { return adoptRef(*new HaikuTrackConfig); }
++
++    bool sameDecoderSetup(const HaikuTrackConfig& other) const
++    {
++        return kind == other.kind && codec == other.codec && width == other.width
++            && height == other.height && sampleRate == other.sampleRate
++            && channels == other.channels && codecPrivate == other.codecPrivate;
++    }
++
++    Kind kind { Kind::Video };
++    String codec; // the sample entry's four-character code: avc1, avc3, mp4a
++    uint32_t timescale { 1 };
++    uint32_t width { 0 };
++    uint32_t height { 0 };
++    uint32_t sampleRate { 0 };
++    uint32_t channels { 0 };
++    Vector<uint8_t> codecPrivate;
++
++private:
++    HaikuTrackConfig() = default;
++};
++
++// One coded frame out of an fMP4 fragment.
++class HaikuMediaSample final : public MediaSample {
++public:
++    static Ref<HaikuMediaSample> create(TrackID trackID, Ref<HaikuTrackConfig>&& config,
++        Vector<uint8_t>&& data, const MediaTime& presentationTime, const MediaTime& decodeTime,
++        const MediaTime& duration, bool isSync)
++    {
++        return adoptRef(*new HaikuMediaSample(trackID, WTFMove(config), WTFMove(data),
++            presentationTime, decodeTime, duration, isSync));
++    }
++
++    MediaTime presentationTime() const final { return m_presentationTime; }
++    MediaTime decodeTime() const final { return m_decodeTime; }
++    MediaTime duration() const final { return m_duration; }
++    TrackID trackID() const final { return m_trackID; }
++    size_t sizeInBytes() const final { return m_data.size() + sizeof(*this); }
++    FloatSize presentationSize() const final
++    {
++        return FloatSize(m_config->width, m_config->height);
++    }
++    void offsetTimestampsBy(const MediaTime& offset) final
++    {
++        m_presentationTime += offset;
++        m_decodeTime += offset;
++    }
++    void setTimestamps(const MediaTime& presentationTime, const MediaTime& decodeTime) final
++    {
++        m_presentationTime = presentationTime;
++        m_decodeTime = decodeTime;
++    }
++    Ref<MediaSample> createNonDisplayingCopy() const final
++    {
++        auto copy = adoptRef(*new HaikuMediaSample(m_trackID, m_config.copyRef(),
++            Vector<uint8_t>(m_data), m_presentationTime, m_decodeTime, m_duration, m_isSync));
++        copy->m_isNonDisplaying = true;
++        return copy;
++    }
++    SampleFlags flags() const final
++    {
++        unsigned flags = None;
++        if (m_isSync)
++            flags |= IsSync;
++        if (m_isNonDisplaying)
++            flags |= IsNonDisplaying;
++        return SampleFlags(flags);
++    }
++    PlatformSample platformSample() const final { return { PlatformSample::None, { nullptr } }; }
++    PlatformSample::Type platformSampleType() const final { return PlatformSample::None; }
++    void dump(PrintStream& out) const final
++    {
++        out.print("{PTS(", m_presentationTime, "), DTS(", m_decodeTime, "), duration(", m_duration, "), sync(", m_isSync, ")}");
++    }
++
++    const Vector<uint8_t>& data() const { return m_data; }
++    const HaikuTrackConfig& config() const { return m_config.get(); }
++    Ref<HaikuTrackConfig> protectedConfig() const { return m_config.copyRef(); }
++    bool isNonDisplaying() const { return m_isNonDisplaying; }
++
++private:
++    HaikuMediaSample(TrackID trackID, Ref<HaikuTrackConfig>&& config, Vector<uint8_t>&& data,
++        const MediaTime& presentationTime, const MediaTime& decodeTime, const MediaTime& duration,
++        bool isSync)
++        : m_trackID(trackID)
++        , m_config(WTFMove(config))
++        , m_data(WTFMove(data))
++        , m_presentationTime(presentationTime)
++        , m_decodeTime(decodeTime)
++        , m_duration(duration)
++        , m_isSync(isSync)
++    {
++    }
++
++    TrackID m_trackID;
++    Ref<HaikuTrackConfig> m_config;
++    Vector<uint8_t> m_data;
++    MediaTime m_presentationTime;
++    MediaTime m_decodeTime;
++    MediaTime m_duration;
++    bool m_isSync { false };
++    bool m_isNonDisplaying { false };
++};
++
++} // namespace WebCore
++
++#endif
+diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaiku.cpp haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaiku.cpp
+--- orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaiku.cpp
++++ haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaiku.cpp
+@@ -19,6 +19,7 @@
+ 
+ #include "config.h"
+ #include "MediaPlayerPrivateHaiku.h"
++#include "HLSMediaIOHaiku.h"
+ 
+ #if ENABLE(VIDEO)
+ 
+@@ -26,8 +27,10 @@
+ #include "NotImplemented.h"
+ #include "wtf/text/CString.h"
+ #include "wtf/NeverDestroyed.h"
++#include <wtf/Threading.h>
+ 
+ #include <support/Locker.h>
++#include <Autolock.h>
+ #include <Bitmap.h>
+ #include <DataIO.h>
+ #include <HttpRequest.h>
+@@ -37,8 +40,65 @@
+ #include <SoundPlayer.h>
+ #include <View.h>
+ 
++#include <stdio.h>
++#include <stdlib.h>
++#include <set>
++
+ namespace WebCore {
+ 
++static bool mediaDebug()
++{
++    static const bool debug = getenv("WEBKIT_MEDIA_DEBUG") != nullptr;
++    return debug;
++}
++
++// Sound players still running when the process exits. WebPositive quits
++// without destroying its pages, so a playing <video> keeps its BSoundPlayer
++// while libmedia tears itself down, and the player's node thread then asks
++// for a buffer from a buffer list that is gone: a crash on every quit during
++// playback. They are stopped from an atexit handler, which runs before the
++// libraries' own teardown.
++static BLocker& soundPlayersLock()
++{
++    static BLocker lock("HTML5 sound players");
++    return lock;
++}
++
++static std::set<BSoundPlayer*>& soundPlayers()
++{
++    static std::set<BSoundPlayer*>* players = new std::set<BSoundPlayer*>;
++    return *players;
++}
++
++static void stopSoundPlayersAtExit()
++{
++    BAutolock locker(soundPlayersLock());
++    for (BSoundPlayer* player : soundPlayers())
++        player->Stop(true, false);
++}
++
++void registerHTML5SoundPlayer(BSoundPlayer* player)
++{
++    static bool registered = false;
++    BAutolock locker(soundPlayersLock());
++    if (!registered) {
++        atexit(stopSoundPlayersAtExit);
++        registered = true;
++    }
++    soundPlayers().insert(player);
++}
++
++void deleteHTML5SoundPlayer(BSoundPlayer* player)
++{
++    if (!player)
++        return;
++    {
++        BAutolock locker(soundPlayersLock());
++        soundPlayers().erase(player);
++    }
++    delete player;
++}
++
+ class MediaPlayerFactoryHaiku final : public MediaPlayerFactory {
+ private:
+     MediaPlayerEnums::MediaEngineIdentifier identifier() const final { return MediaPlayerEnums::MediaEngineIdentifier::Haiku; };
+@@ -88,7 +148,7 @@
+ 
+ MediaPlayerPrivate::~MediaPlayerPrivate()
+ {
+-    delete m_soundPlayer;
++    deleteHTML5SoundPlayer(m_soundPlayer);
+ 
+     m_mediaLock.Lock();
+ 
+@@ -98,9 +158,11 @@
+ }
+ 
+ #if ENABLE(MEDIA_SOURCE)
+-void MediaPlayerPrivate::load(const String& url, WebCore::MediaSourcePrivateClient*)
++void MediaPlayerPrivate::load(const URL&, const ContentType&, MediaSourcePrivateClient&)
+ {
+-    load(url);
++    // Media Source is MediaPlayerPrivateHaikuMSE's.
++    m_networkState = MediaPlayer::NetworkState::FormatError;
++    m_player->networkStateChanged();
+ }
+ #endif
+ 
+@@ -109,28 +171,81 @@
+     // Cleanup from previous request (can this even happen?)
+     if (m_soundPlayer)
+         m_soundPlayer->Stop(false);
+-    delete m_soundPlayer;
++    deleteHTML5SoundPlayer(m_soundPlayer);
++    m_soundPlayer = nullptr;
+ 
+-    m_mediaLock.Lock();
+     cancelLoad();
+ 
++    if (mediaDebug())
++        fprintf(stderr, "[media] load %s\n", url.left(300).utf8().data());
++
++    m_networkState = MediaPlayer::NetworkState::Loading;
++    m_readyState = MediaPlayer::ReadyState::HaveNothing;
++    m_player->networkStateChanged();
++    m_player->readyStateChanged();
++
++    // Open the media off the main thread; see m_loadGeneration.
++    uint32 generation = ++m_loadGeneration;
++    WeakPtr<MediaPlayerPrivate> weak = WeakPtr(this);
++    String source = url.isolatedCopy();
++    String userAgent = m_player->userAgent().isolatedCopy();
++    Thread::create("HaikuMediaOpen"_s, [weak, source, userAgent, generation] {
++        HLSMediaIO* hls = nullptr;
++        bool live = false;
++        BMediaFile* file = openMediaFile(source, userAgent, hls, live);
++        callOnMainThread([weak, file, hls, live, generation] {
++            if (!weak || weak->m_loadGeneration != generation) {
++                delete file;
++                delete hls;
++                return;
++            }
++            weak->didOpen(file, hls, live);
++        });
++    })->detach();
++}
++
++BMediaFile* MediaPlayerPrivate::openMediaFile(const String& url, const String& userAgent,
++    HLSMediaIO*& hls, bool& live)
++{
++    CString source = url.utf8();
++    if (!HLSMediaIO::IsHLSURL(source.data()))
++        return new BMediaFile(BUrl(source.data(), true));
++
++    hls = new HLSMediaIO(source.data(), userAgent.utf8().data());
++    if (hls->Open() != B_OK)
++        return nullptr;
++    BMediaFile* file = new BMediaFile(hls);
++    live = hls->IsLive();
++    return file;
++}
++
++void MediaPlayerPrivate::didOpen(BMediaFile* file, HLSMediaIO* hls, bool live)
++{
++    m_mediaLock.Lock();
++    m_mediaFile = file;
++    m_hlsIO = hls;
++    m_live = live;
+     m_mediaLock.Unlock();
+ 
++    IdentifyTracks();
++    if (mediaDebug()) {
++        fprintf(stderr, "[media] opened: %s, audio %d, video %d%s\n",
++            m_mediaFile ? strerror(m_mediaFile->InitCheck()) : "no file",
++            m_audioTrack != nullptr, m_videoTrack != nullptr, m_live ? ", live" : "");
++    }
++
+     // TODO we need more detailed info from the BMediaFile to accurately report
+     // the m_readyState and the m_networkState to WebKit. The API will need to
+     // be extended on Haiku side to query the internal state (and probably
+     // BMediaFile should not block until data is ready?)
+-    IdentifyTracks(url);
+     if (m_mediaFile && m_mediaFile->InitCheck() == B_OK) {
+         m_player->characteristicChanged();
+         m_player->durationChanged();
+         m_player->sizeChanged();
+         m_player->firstVideoFrameAvailable();
+ 
+-        //m_readyState = MediaPlayer::HaveMetadata;
+-        //m_readyState = MediaPlayer::HaveFutureData;
+         m_readyState = MediaPlayer::ReadyState::HaveEnoughData;
+-        m_networkState = MediaPlayer::NetworkState::Loaded; // Loading;
++        m_networkState = MediaPlayer::NetworkState::Loaded;
+     } else {
+         m_readyState = MediaPlayer::ReadyState::HaveMetadata;
+         m_networkState = MediaPlayer::NetworkState::FormatError;
+@@ -144,6 +259,10 @@
+     m_mediaLock.Lock();
+     delete m_mediaFile;
+     m_mediaFile = nullptr;
++    // After the BMediaFile: it reads from the HLS stream until deleted.
++    delete m_hlsIO;
++    m_hlsIO = nullptr;
++    m_live = false;
+     m_audioTrack = nullptr;
+     m_videoTrack = nullptr;
+     m_mediaLock.Unlock();
+@@ -165,11 +284,15 @@
+     // Deleting the BMediaFile release the tracks
+     if (player->m_audioTrack) {
+         // TODO handle the case where there is a video, but no audio track.
+-        player->m_currentTime = player->m_audioTrack->CurrentTime() / 1000000.f;
+-
+-        int64 size64;
+-        if (player->m_audioTrack->ReadFrames(buffer, &size64) != B_OK)
+-        {
++        int64 size64 = 0;
++        if (player->m_audioTrack->ReadFrames(buffer, &size64) == B_OK) {
++            player->m_audioFramesPlayed += size64;
++            if (player->m_audioRate > 0) {
++                player->m_currentTime = player->m_timeBase
++                    + player->m_audioFramesPlayed / player->m_audioRate;
++            } else
++                player->m_currentTime = player->m_audioTrack->CurrentTime() / 1000000.f;
++        } else {
+             // Notify that we're done playing...
+             player->m_currentTime = player->m_audioTrack->Duration() / 1000000.f;
+             player->m_soundPlayer->Stop(false);
+@@ -186,15 +309,18 @@
+     }
+ 
+     if (player->m_videoTrack && player->m_audioTrack) {
+-        if (player->m_videoTrack->CurrentTime()
+-            < player->m_audioTrack->CurrentTime())
++        double videoTime = player->m_videoRate > 0
++            ? player->m_timeBase + player->m_videoFramesShown / player->m_videoRate
++            : player->m_videoTrack->CurrentTime() / 1000000.0;
++        if (videoTime < player->m_currentTime)
+         {
+             // Decode a video frame and show it on screen
+             int64 count;
+             if (player->m_videoTrack->ReadFrames(player->m_frameBuffer->Bits(),
+                 &count) != B_OK) {
+                 player->m_videoTrack = nullptr;
+-            }
++            } else
++                player->m_videoFramesShown++;
+ 
+             WeakPtr<MediaPlayerPrivate> p = WeakPtr(player);
+             callOnMainThread([p] {
+@@ -248,6 +374,8 @@
+ WTF::MediaTime MediaPlayerPrivate::duration() const
+ {
+     // TODO handle the case where there is a video, but no audio track.
++    if (m_live)
++        return WTF::MediaTime::positiveInfiniteTime();
+     if (!m_audioTrack)
+         return WTF::MediaTime();
+     return WTF::MediaTime::createWithDouble(m_audioTrack->Duration() / 1000000.f);
+@@ -273,10 +401,16 @@
+     // Usually, seeking the video is rounded to the nearest keyframe. This
+     // modifies newTime, and we pass the adjusted value to the audio track, to
+     // keep them in sync
++    m_mediaLock.Lock();
+     if (m_videoTrack)
+         m_videoTrack->SeekToTime(&newTime);
+     if (m_audioTrack)
+         m_audioTrack->SeekToTime(&newTime);
++    m_timeBase = newTime / 1000000.0;
++    m_audioFramesPlayed = 0;
++    m_videoFramesShown = 0;
++    m_currentTime = m_timeBase;
++    m_mediaLock.Unlock();
+ }
+ 
+ bool MediaPlayerPrivate::seeking() const
+@@ -335,14 +469,9 @@
+ 
+ // #pragma mark - private methods
+ 
+-void MediaPlayerPrivate::IdentifyTracks(const String& url)
++void MediaPlayerPrivate::IdentifyTracks()
+ {
+-    // TODO something here is blocking inside the Media Kit. We should rework
+-    // things so that this is run in a separate thread (Media Thread?). This
+-    // would avoid the annoying freeze whenever a media is being loaded.
+-    m_mediaFile = new BMediaFile(BUrl(url.utf8().data(), true));
+-
+-    if (m_mediaFile->InitCheck() == B_OK) {
++    if (m_mediaFile && m_mediaFile->InitCheck() == B_OK) {
+         for (int i = m_mediaFile->CountTracks() - 1; i >= 0; i--)
+         {
+             BMediaTrack* track = m_mediaFile->TrackAt(i);
+@@ -354,6 +483,7 @@
+                 if (m_videoTrack)
+                     continue;
+                 m_videoTrack = track;
++                m_videoRate = format.u.raw_video.field_rate;
+ 
+                 m_frameBuffer = new BBitmap(
+                     BRect(0, 0, format.Width() - 1, format.Height() - 1),
+@@ -367,9 +497,11 @@
+                 if (m_audioTrack)
+                     continue;
+                 m_audioTrack = track;
++                m_audioRate = format.u.raw_audio.frame_rate;
+ 
+                 m_soundPlayer = new BSoundPlayer(&format.u.raw_audio,
+                     "HTML5 Audio", playCallback, NULL, this);
++                registerHTML5SoundPlayer(m_soundPlayer);
+                 m_soundPlayer->SetVolume(m_volume);
+                 if (!m_paused)
+                     m_soundPlayer->Start();
+@@ -399,6 +531,12 @@
+         cache.get().add(String::fromUTF8(mfi.mime_type));
+     }
+ 
++    // HTTP Live Streaming, which HLSMediaIO reads for the Media Kit.
++    cache.get().add("application/vnd.apple.mpegurl"_s);
++    cache.get().add("application/x-mpegurl"_s);
++    cache.get().add("audio/mpegurl"_s);
++    cache.get().add("audio/x-mpegurl"_s);
++
+     typeListInitialized = true;
+     return cache;
+ }
+@@ -408,14 +546,46 @@
+     types = mimeTypeCache();
+ }
+ 
++static MediaPlayer::SupportsType supportsTypeImpl(const MediaEngineSupportParameters&);
++
+ MediaPlayer::SupportsType MediaPlayerPrivate::supportsType(const MediaEngineSupportParameters& parameters)
+ {
++    MediaPlayer::SupportsType result = supportsTypeImpl(parameters);
++    if (mediaDebug()) {
++        fprintf(stderr, "[media] canPlayType %s -> %s\n", parameters.type.raw().utf8().data(),
++            result == MediaPlayer::SupportsType::IsSupported ? "probably"
++            : result == MediaPlayer::SupportsType::MayBeSupported ? "maybe" : "no");
++    }
++    return result;
++}
++
++static MediaPlayer::SupportsType supportsTypeImpl(const MediaEngineSupportParameters& parameters)
++{
++    if (parameters.isMediaSource)
++        return MediaPlayer::SupportsType::IsNotSupported;
+     if (parameters.type.isEmpty())
+         return MediaPlayer::SupportsType::IsNotSupported;
+ 
++
+     // spec says we should not return "probably" if the codecs string is empty
+-    if (mimeTypeCache().contains(parameters.type.containerType())) {
+-        return parameters.type.codecs().isEmpty() ? MediaPlayer::SupportsType::MayBeSupported : MediaPlayer::SupportsType::IsSupported;
++    if (mimeTypeCache().contains(parameters.type.containerType().convertToASCIILowercase())) {
++        if (parameters.type.codecs().isEmpty())
++            return MediaPlayer::SupportsType::MayBeSupported;
++        // Answer for each codec, not just the container. YouTube asks about
++        // codecs that do not exist (av99) and about AV1 to see whether the
++        // answers mean anything; a browser that says yes to everything is
++        // told it cannot play the video at all. H.264 is the one video codec
++        // this hardware plays (the GMA500 decodes it); VP9 and AV1 in
++        // software are too slow on it, so they are not offered.
++        for (auto& codec : parameters.type.codecs()) {
++            String c = codec.convertToASCIILowercase();
++            if (!(c.startsWith("avc1"_s) || c.startsWith("avc3"_s)
++                || c.startsWith("mp4a"_s) || c == "mp3"_s || c == "opus"_s
++                || c == "vorbis"_s || c == "flac"_s || c == "vp8"_s
++                || c.startsWith("vp8."_s)))
++                return MediaPlayer::SupportsType::IsNotSupported;
++        }
++        return MediaPlayer::SupportsType::IsSupported;
+     }
+ 
+     return MediaPlayer::SupportsType::IsNotSupported;
+diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaiku.h haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaiku.h
+--- orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaiku.h
++++ haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaiku.h
+@@ -39,6 +39,11 @@
+ namespace WebCore {
+ 
+ class MediaPlayerFactoryHaiku;
++class HLSMediaIO;
++
++// Sound players are stopped at process exit; see MediaPlayerPrivateHaiku.cpp.
++void registerHTML5SoundPlayer(BSoundPlayer*);
++void deleteHTML5SoundPlayer(BSoundPlayer*);
+ 
+ class MediaPlayerPrivate
+     : public MediaPlayerPrivateInterface
+@@ -62,7 +67,7 @@
+ 
+         void load(const String& url) override;
+ #if ENABLE(MEDIA_SOURCE)
+-        void load(const String& url, MediaSourcePrivateClient*) override;
++        void load(const URL&, const ContentType&, MediaSourcePrivateClient&) override;
+ #endif
+         void cancelLoad() override;
+ 
+@@ -99,7 +104,10 @@
+ 
+     constexpr MediaPlayerType mediaPlayerType() const final { return MediaPlayerType::Haiku; }
+ private:
+-        void IdentifyTracks(const String& url);
++        void IdentifyTracks();
++        void didOpen(BMediaFile*, HLSMediaIO*, bool live);
++        static BMediaFile* openMediaFile(const String& url, const String& userAgent,
++            HLSMediaIO*& hls, bool& live);
+ 
+         static void playCallback(void*, void*, size_t,
+             const media_raw_audio_format&);
+@@ -123,6 +131,25 @@
+         float m_volume;
+         float m_currentTime;
+         bool m_paused;
++
++        // The playback clock. The Media Kit decoders do not report reliable
++        // times for every format -- on MP4, the ffmpeg plugin's AAC decoder
++        // advances CurrentTime() by about a twentieth of real time -- so the
++        // clock counts what was actually played: audio frames handed to the
++        // sound player, and video frames shown, from the last seek.
++        double m_timeBase { 0 };
++        int64 m_audioFramesPlayed { 0 };
++        int64 m_videoFramesShown { 0 };
++        double m_audioRate { 0 };
++        double m_videoRate { 0 };
++
++        // Opening a URL blocks until the Media Kit has read enough to identify
++        // the tracks -- seconds on this hardware, and it used to happen on the
++        // main thread, freezing the whole page. It runs on its own thread now;
++        // a load started later makes an earlier one's result stale.
++        uint32 m_loadGeneration { 0 };
++        HLSMediaIO* m_hlsIO { nullptr };
++        bool m_live { false };
+ };
+ 
+ }
+diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaikuMSE.cpp haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaikuMSE.cpp
+--- orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaikuMSE.cpp	1970-01-01 00:00:00.000000000 +0000
++++ haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaikuMSE.cpp
+@@ -0,0 +1,933 @@
++/*
++ * Copyright (C) 2026 rainygirl
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Library General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ */
++
++#include "config.h"
++#include "MediaPlayerPrivateHaikuMSE.h"
++
++#if ENABLE(MEDIA_SOURCE)
++
++#include "ContentType.h"
++#include "GraphicsContext.h"
++#include "MediaPlayer.h"
++#include "MediaPlayerPrivateHaiku.h"
++#include "MediaSourcePrivateClient.h"
++#include "MediaSourcePrivateHaiku.h"
++#include "SourceBufferPrivateHaiku.h"
++#include "VideoPlaybackQualityMetrics.h"
++#include <wtf/MainThread.h>
++#include <wtf/NativePromise.h>
++#include <wtf/NeverDestroyed.h>
++#include <wtf/RunLoop.h>
++
++#include <Autolock.h>
++#include <Bitmap.h>
++#include <MediaDecoder.h>
++#include <MediaFormats.h>
++#include <SoundPlayer.h>
++#include <View.h>
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++namespace WebCore {
++
++static bool mseDebug()
++{
++    static const bool debug = getenv("WEBKIT_MEDIA_DEBUG") != nullptr;
++    return debug;
++}
++
++#define MSE_LOG(...) do { if (mseDebug()) fprintf(stderr, "[mse] " __VA_ARGS__); } while (0)
++
++// The codec numbers the Media Kit's ffmpeg reader registers its formats
++// under (FFmpeg's AVCodecID). Decoders, the GMA500's H.264 add-on included,
++// are found by these.
++static const uint32 kCodecH264 = 27;
++static const uint32 kCodecAAC = 86018;
++
++// Queue depths: how far ahead of the decoder WebCore may hand samples over.
++static const size_t kVideoQueueHigh = 60;
++static const size_t kVideoQueueLow = 30;
++static const size_t kAudioQueueHigh = 120;
++static const size_t kAudioQueueLow = 60;
++
++// A video decoder is not given its last few samples until more arrive: an
++// H.264 decoder that runs out of input mid-reorder drains itself and has to
++// be started again.
++static const size_t kVideoDecodeMinimum = 6;
++static const size_t kDecodedFramesAhead = 3;
++
++// One coded stream through a Media Kit decoder. Samples are taken from the
++// player's queue for the track, in decode order.
++class HaikuSampleDecoder final : public BMediaDecoder {
++public:
++    HaikuSampleDecoder(MediaPlayerPrivateHaikuMSE& player, TrackID trackID, Ref<HaikuTrackConfig>&& config)
++        : m_player(player)
++        , m_trackID(trackID)
++        , m_config(WTFMove(config))
++    {
++    }
++
++    status_t initialize()
++    {
++        const HaikuTrackConfig& config = m_config.get();
++        bool video = config.kind == HaikuTrackConfig::Kind::Video;
++
++        media_format_description description;
++        description.family = B_MISC_FORMAT_FAMILY;
++        description.u.misc.file_format = 'ffmp';
++        description.u.misc.codec = video ? kCodecH264 : kCodecAAC;
++
++        media_format format;
++        BMediaFormats formats;
++        if (formats.GetFormatFor(description, &format) != B_OK) {
++            format.Clear();
++            format.type = video ? B_MEDIA_ENCODED_VIDEO : B_MEDIA_ENCODED_AUDIO;
++            if (video)
++                format.u.encoded_video = media_encoded_video_format::wildcard;
++            else
++                format.u.encoded_audio = media_encoded_audio_format::wildcard;
++            status_t status = formats.MakeFormatFor(&description, 1, &format);
++            if (status != B_OK && status != B_MEDIA_DUPLICATE_FORMAT)
++                return status;
++        }
++
++        if (video) {
++            format.u.encoded_video.output.display.line_width = config.width;
++            format.u.encoded_video.output.display.line_count = config.height;
++            format.u.encoded_video.output.field_rate = 30;
++        } else {
++            format.u.encoded_audio.output.frame_rate = config.sampleRate;
++            format.u.encoded_audio.output.channel_count = config.channels;
++            format.u.encoded_audio.output.format = media_raw_audio_format::B_AUDIO_FLOAT;
++            format.u.encoded_audio.output.byte_order = B_MEDIA_HOST_ENDIAN;
++            format.u.encoded_audio.frame_size = 1024;
++        }
++
++        status_t status = SetTo(&format, config.codecPrivate.data(), config.codecPrivate.size());
++        if (status != B_OK)
++            return status;
++
++        m_output.Clear();
++        if (video) {
++            m_output.type = B_MEDIA_RAW_VIDEO;
++            m_output.u.raw_video = media_raw_video_format::wildcard;
++            m_output.u.raw_video.display.format = B_RGB32;
++            m_output.u.raw_video.display.line_width = config.width;
++            m_output.u.raw_video.display.line_count = config.height;
++            m_output.u.raw_video.display.bytes_per_row = config.width * 4;
++        } else {
++            m_output.type = B_MEDIA_RAW_AUDIO;
++            m_output.u.raw_audio = media_raw_audio_format::wildcard;
++            m_output.u.raw_audio.format = media_raw_audio_format::B_AUDIO_FLOAT;
++            m_output.u.raw_audio.byte_order = B_MEDIA_HOST_ENDIAN;
++        }
++        status = SetOutputFormat(&m_output);
++        if (status != B_OK)
++            return status;
++
++        media_codec_info info;
++        if (GetDecoderInfo(&info) == B_OK)
++            MSE_LOG("%s decoder: %s\n", video ? "video" : "audio", info.pretty_name);
++        return B_OK;
++    }
++
++    const HaikuTrackConfig& config() const { return m_config.get(); }
++    const media_format& output() const { return m_output; }
++
++protected:
++    status_t GetNextChunk(const void** chunkData, size_t* chunkLength, media_header* header) final
++    {
++        BAutolock locker(m_player.m_lock);
++        auto* track = m_player.trackFor(m_trackID);
++        if (!track || track->queue.isEmpty())
++            return B_LAST_BUFFER_ERROR;
++        m_current = track->queue.takeFirst();
++        m_player.requestMoreSamplesIfNeeded(*track);
++
++        memset(header, 0, sizeof(*header));
++        header->type = m_config->kind == HaikuTrackConfig::Kind::Video ? B_MEDIA_ENCODED_VIDEO : B_MEDIA_ENCODED_AUDIO;
++        header->start_time = bigtime_t(m_current->presentationTime().toDouble() * 1000000);
++        header->size_used = m_current->data().size();
++        *chunkData = m_current->data().data();
++        *chunkLength = m_current->data().size();
++        return B_OK;
++    }
++
++private:
++    MediaPlayerPrivateHaikuMSE& m_player;
++    TrackID m_trackID;
++    Ref<HaikuTrackConfig> m_config;
++    RefPtr<HaikuMediaSample> m_current;
++    media_format m_output;
++};
++
++class MediaPlayerFactoryHaikuMSE final : public MediaPlayerFactory {
++private:
++    MediaPlayerEnums::MediaEngineIdentifier identifier() const final { return MediaPlayerEnums::MediaEngineIdentifier::HaikuMSE; }
++
++    Ref<MediaPlayerPrivateInterface> createMediaEnginePlayer(MediaPlayer* player) const final
++    {
++        return adoptRef(*new MediaPlayerPrivateHaikuMSE(player));
++    }
++
++    void getSupportedTypes(HashSet<String>& types) const final
++    {
++        MediaPlayerPrivateHaikuMSE::getSupportedTypes(types);
++    }
++
++    MediaPlayer::SupportsType supportsTypeAndCodecs(const MediaEngineSupportParameters& parameters) const final
++    {
++        return MediaPlayerPrivateHaikuMSE::supportsType(parameters);
++    }
++};
++
++void MediaPlayerPrivateHaikuMSE::registerMediaEngine(MediaEngineRegistrar registrar)
++{
++    registrar(makeUnique<MediaPlayerFactoryHaikuMSE>());
++}
++
++void MediaPlayerPrivateHaikuMSE::getSupportedTypes(HashSet<String>& types)
++{
++    types.add("video/mp4"_s);
++    types.add("audio/mp4"_s);
++}
++
++// fMP4 with H.264 and AAC, which is what the hardware here plays. WebM (VP9,
++// Opus) is refused so that sites send MP4: VP9 in software is too slow on
++// this machine, and an honest "no" is what makes YouTube pick H.264.
++MediaPlayer::SupportsType MediaPlayerPrivateHaikuMSE::supportsType(const MediaEngineSupportParameters& parameters)
++{
++    MediaPlayer::SupportsType result = MediaPlayer::SupportsType::IsNotSupported;
++    if (parameters.isMediaSource) {
++        String container = parameters.type.containerType().convertToASCIILowercase();
++        if (SourceBufferPrivateHaiku::supportsContainer(container)) {
++            auto codecs = parameters.type.codecs();
++            if (codecs.isEmpty())
++                result = MediaPlayer::SupportsType::MayBeSupported;
++            else {
++                result = MediaPlayer::SupportsType::IsSupported;
++                for (auto& codec : codecs) {
++                    String c = codec.convertToASCIILowercase();
++                    bool video = c.startsWith("avc1"_s) || c.startsWith("avc3"_s);
++                    bool audio = c == "mp4a.40.2"_s || c == "mp4a.40.5"_s || c == "mp4a.40.29"_s || c == "mp4a.40"_s;
++                    if (!video && !audio)
++                        result = MediaPlayer::SupportsType::IsNotSupported;
++                    if (video && container == "audio/mp4"_s)
++                        result = MediaPlayer::SupportsType::IsNotSupported;
++                }
++            }
++        }
++    }
++    MSE_LOG("isTypeSupported %s -> %s\n", parameters.isMediaSource ? parameters.type.raw().utf8().data() : "(not MSE)",
++        result == MediaPlayer::SupportsType::IsSupported ? "probably"
++        : result == MediaPlayer::SupportsType::MayBeSupported ? "maybe" : "no");
++    return result;
++}
++
++MediaPlayerPrivateHaikuMSE::MediaPlayerPrivateHaikuMSE(MediaPlayer* player)
++    : m_player(player)
++{
++}
++
++MediaPlayerPrivateHaikuMSE::~MediaPlayerPrivateHaikuMSE()
++{
++    stopDecodeThread();
++    deleteHTML5SoundPlayer(m_soundPlayer);
++    m_soundPlayer = nullptr;
++    delete m_videoDecoder;
++    delete m_audioDecoder;
++    for (auto& frame : m_frames)
++        delete frame.bitmap;
++    for (auto* bitmap : m_freeBitmaps)
++        delete bitmap;
++    delete m_displayBitmap;
++}
++
++void MediaPlayerPrivateHaikuMSE::load(const String&)
++{
++    setNetworkState(MediaPlayer::NetworkState::FormatError);
++}
++
++void MediaPlayerPrivateHaikuMSE::load(const URL&, const ContentType&, MediaSourcePrivateClient& client)
++{
++    if (RefPtr mediaSourcePrivate = dynamicDowncast<MediaSourcePrivateHaiku>(client.mediaSourcePrivate())) {
++        mediaSourcePrivate->setPlayer(this);
++        m_mediaSourcePrivate = WTFMove(mediaSourcePrivate);
++        client.reOpen();
++    } else
++        m_mediaSourcePrivate = MediaSourcePrivateHaiku::create(*this, client);
++    MSE_LOG("MediaSource attached\n");
++    startDecodeThread();
++}
++
++void MediaPlayerPrivateHaikuMSE::cancelLoad()
++{
++    stopDecodeThread();
++}
++
++void MediaPlayerPrivateHaikuMSE::play()
++{
++    {
++        BAutolock locker(m_lock);
++        if (m_playing)
++            return;
++        m_playing = true;
++        m_clockStarted = system_time();
++        if (m_soundPlayer)
++            m_soundPlayer->Start();
++    }
++    MSE_LOG("play at %.3f\n", currentTime().toDouble());
++}
++
++void MediaPlayerPrivateHaikuMSE::pause()
++{
++    BAutolock locker(m_lock);
++    if (!m_playing)
++        return;
++    MSE_LOG("pause at %.3f\n", clockLocked());
++    m_clockBase = clockLocked();
++    m_playing = false;
++    m_clockStarted = 0;
++    if (m_soundPlayer)
++        m_soundPlayer->Stop(false);
++}
++
++double MediaPlayerPrivateHaikuMSE::clockLocked() const
++{
++    if (m_haveAudioTrack) {
++        // The audio decides. Until its first frame is decoded the clock
++        // stands at the seek position.
++        return m_audioClock ? m_audioNextTime : m_clockBase;
++    }
++    if (m_playing && m_clockStarted)
++        return m_clockBase + (system_time() - m_clockStarted) / 1000000.0;
++    return m_clockBase;
++}
++
++MediaTime MediaPlayerPrivateHaikuMSE::currentTime() const
++{
++    if (m_lastSeekTarget)
++        return m_lastSeekTarget->time;
++    BAutolock locker(m_lock);
++    return MediaTime::createWithDouble(clockLocked());
++}
++
++bool MediaPlayerPrivateHaikuMSE::timeIsProgressing() const
++{
++    BAutolock locker(m_lock);
++    return m_playing && (!m_haveAudioTrack || (m_audioClock && m_ringFill));
++}
++
++void MediaPlayerPrivateHaikuMSE::seekToTarget(const SeekTarget& target)
++{
++    MSE_LOG("seek to %.3f\n", target.time.toDouble());
++    m_lastSeekTarget = target;
++    {
++        BAutolock locker(m_lock);
++        m_seekFloor = target.time.toDouble();
++        m_seeking = true;
++    }
++    m_mediaSourcePrivate->waitForTarget(target)->whenSettled(RunLoop::current(), [this, weakThis = WeakPtr { *this }](auto&& result) {
++        if (!weakThis)
++            return;
++        if (!result) {
++            MSE_LOG("seek: waitForTarget failed\n");
++            return;
++        }
++        MediaTime seekTime = *result;
++        MSE_LOG("seek: target buffered, seeking to %.3f\n", seekTime.toDouble());
++        m_mediaSourcePrivate->seekToTime(seekTime)->whenSettled(RunLoop::current(), [this, weakThis, seekTime] {
++            if (!weakThis)
++                return;
++            {
++                BAutolock locker(m_lock);
++                m_clockBase = seekTime.toDouble();
++                m_seekFloor = m_clockBase;
++                m_clockStarted = m_playing ? system_time() : 0;
++                m_audioClock = false;
++                m_ringRead = m_ringFill = 0;
++                m_showFirstFrame = true;
++                m_seeking = false;
++            }
++            m_lastSeekTarget.reset();
++            MSE_LOG("seeked to %.3f\n", seekTime.toDouble());
++            if (auto player = m_player.get()) {
++                player->seeked(seekTime);
++                player->timeChanged();
++            }
++        });
++    });
++}
++
++void MediaPlayerPrivateHaikuMSE::setVolume(float volume)
++{
++    BAutolock locker(m_lock);
++    m_volume = volume;
++    if (m_soundPlayer)
++        m_soundPlayer->SetVolume(m_muted ? 0 : m_volume);
++}
++
++void MediaPlayerPrivateHaikuMSE::setMuted(bool muted)
++{
++    BAutolock locker(m_lock);
++    m_muted = muted;
++    if (m_soundPlayer)
++        m_soundPlayer->SetVolume(m_muted ? 0 : m_volume);
++}
++
++FloatSize MediaPlayerPrivateHaikuMSE::naturalSize() const
++{
++    BAutolock locker(m_lock);
++    if (!m_videoConfig)
++        return { };
++    return FloatSize(m_videoConfig->width, m_videoConfig->height);
++}
++
++bool MediaPlayerPrivateHaikuMSE::hasVideo() const
++{
++    return m_mediaSourcePrivate && m_mediaSourcePrivate->hasVideo();
++}
++
++bool MediaPlayerPrivateHaikuMSE::hasAudio() const
++{
++    return m_mediaSourcePrivate && m_mediaSourcePrivate->hasAudio();
++}
++
++MediaTime MediaPlayerPrivateHaikuMSE::duration() const
++{
++    return m_mediaSourcePrivate ? m_mediaSourcePrivate->duration() : MediaTime::zeroTime();
++}
++
++MediaTime MediaPlayerPrivateHaikuMSE::maxTimeSeekable() const
++{
++    return duration();
++}
++
++bool MediaPlayerPrivateHaikuMSE::didLoadingProgress() const
++{
++    bool progress = m_receivedData;
++    m_receivedData = false;
++    return progress;
++}
++
++void MediaPlayerPrivateHaikuMSE::paint(GraphicsContext& context, const FloatRect& rect)
++{
++    if (context.paintingDisabled())
++        return;
++    BAutolock locker(m_lock);
++    if (!m_displayBitmap)
++        return;
++    BView* view = context.platformContext();
++    view->SetDrawingMode(B_OP_COPY);
++    view->DrawBitmap(m_displayBitmap, rect);
++}
++
++std::optional<VideoPlaybackQualityMetrics> MediaPlayerPrivateHaikuMSE::videoPlaybackQualityMetrics()
++{
++    BAutolock locker(m_lock);
++    return VideoPlaybackQualityMetrics { m_totalFrames, m_droppedFrames, 0, 0, 0 };
++}
++
++DestinationColorSpace MediaPlayerPrivateHaikuMSE::colorSpace()
++{
++    return DestinationColorSpace::SRGB();
++}
++
++void MediaPlayerPrivateHaikuMSE::durationChanged()
++{
++    if (auto player = m_player.get())
++        player->durationChanged();
++}
++
++void MediaPlayerPrivateHaikuMSE::setReadyState(MediaPlayer::ReadyState readyState)
++{
++    if (readyState == m_readyState)
++        return;
++    MSE_LOG("readyState %d\n", int(readyState));
++    m_readyState = readyState;
++    if (auto player = m_player.get())
++        player->readyStateChanged();
++}
++
++void MediaPlayerPrivateHaikuMSE::setNetworkState(MediaPlayer::NetworkState networkState)
++{
++    if (networkState == m_networkState)
++        return;
++    m_networkState = networkState;
++    if (auto player = m_player.get())
++        player->networkStateChanged();
++}
++
++void MediaPlayerPrivateHaikuMSE::notifyActiveSourceBuffersChanged()
++{
++    if (auto player = m_player.get())
++        player->activeSourceBuffersChanged();
++}
++
++// #pragma mark - tracks and queues
++
++MediaPlayerPrivateHaikuMSE::Track* MediaPlayerPrivateHaikuMSE::trackFor(TrackID trackID)
++{
++    auto found = m_tracks.find(trackID);
++    return found == m_tracks.end() ? nullptr : found->value.get();
++}
++
++MediaPlayerPrivateHaikuMSE::Track* MediaPlayerPrivateHaikuMSE::activeTrack(HaikuTrackConfig::Kind kind)
++{
++    if (kind == HaikuTrackConfig::Kind::Video)
++        return m_haveVideoTrack ? trackFor(m_videoTrackID) : nullptr;
++    return m_haveAudioTrack ? trackFor(m_audioTrackID) : nullptr;
++}
++
++void MediaPlayerPrivateHaikuMSE::setTrackConfig(TrackID trackID, Ref<HaikuTrackConfig>&& config)
++{
++    bool sizeChanged = false;
++    {
++        BAutolock locker(m_lock);
++        auto* track = trackFor(trackID);
++        if (!track) {
++            auto newTrack = std::make_unique<Track>();
++            newTrack->id = trackID;
++            newTrack->kind = config->kind;
++            track = newTrack.get();
++            m_tracks.set(trackID, WTFMove(newTrack));
++        }
++        if (config->kind == HaikuTrackConfig::Kind::Video) {
++            if (!m_haveVideoTrack) {
++                m_haveVideoTrack = true;
++                m_videoTrackID = trackID;
++            }
++            if (trackID == m_videoTrackID) {
++                sizeChanged = !m_videoConfig || m_videoConfig->width != config->width
++                    || m_videoConfig->height != config->height;
++                m_videoConfig = config.ptr();
++            }
++        } else if (!m_haveAudioTrack) {
++            m_haveAudioTrack = true;
++            m_audioTrackID = trackID;
++        }
++    }
++    if (sizeChanged) {
++        if (auto player = m_player.get())
++            player->sizeChanged();
++    }
++}
++
++void MediaPlayerPrivateHaikuMSE::flushTrack(TrackID trackID)
++{
++    BAutolock locker(m_lock);
++    auto* track = trackFor(trackID);
++    if (!track)
++        return;
++    // WebCore also flushes outside a seek -- a quality switch re-enqueues
++    // from the last sync frame. The clock must not jump back to the last
++    // seek position then, and the frames before the current time it
++    // decodes again are not late, only not wanted.
++    if (!m_seeking) {
++        double now = clockLocked();
++        m_clockBase = now;
++        m_clockStarted = m_playing ? system_time() : 0;
++        m_seekFloor = now;
++    }
++    track->queue.clear();
++    track->flushRequested = true;
++    if (track->kind == HaikuTrackConfig::Kind::Video) {
++        for (auto& frame : m_frames)
++            m_freeBitmaps.append(frame.bitmap);
++        m_frames.clear();
++    } else {
++        m_ringRead = m_ringFill = 0;
++        m_audioClock = false;
++    }
++}
++
++void MediaPlayerPrivateHaikuMSE::enqueueSample(Ref<HaikuMediaSample>&& sample, TrackID trackID)
++{
++    BAutolock locker(m_lock);
++    auto* track = trackFor(trackID);
++    if (!track) {
++        MSE_LOG("sample for unknown track %llu\n", (unsigned long long)trackID);
++        return;
++    }
++    if (track->queue.isEmpty())
++        MSE_LOG("enqueue: track %llu from %.3f\n", (unsigned long long)trackID, sample->presentationTime().toDouble());
++    track->queue.append(WTFMove(sample));
++    m_receivedData = true;
++}
++
++bool MediaPlayerPrivateHaikuMSE::isReadyForMoreSamples(TrackID trackID)
++{
++    BAutolock locker(m_lock);
++    auto* track = trackFor(trackID);
++    if (!track)
++        return false;
++    size_t high = track->kind == HaikuTrackConfig::Kind::Video ? kVideoQueueHigh : kAudioQueueHigh;
++    return track->queue.size() < high;
++}
++
++void MediaPlayerPrivateHaikuMSE::notifyWhenReadyForMoreSamples(TrackID trackID, SourceBufferPrivateHaiku& sourceBuffer)
++{
++    BAutolock locker(m_lock);
++    auto* track = trackFor(trackID);
++    if (!track)
++        return;
++    track->waitingSourceBuffer = sourceBuffer;
++    track->notifyRequested = true;
++    requestMoreSamplesIfNeeded(*track);
++}
++
++// With m_lock held.
++void MediaPlayerPrivateHaikuMSE::requestMoreSamplesIfNeeded(Track& track)
++{
++    size_t low = track.kind == HaikuTrackConfig::Kind::Video ? kVideoQueueLow : kAudioQueueLow;
++    if (!track.notifyRequested || track.queue.size() >= low)
++        return;
++    track.notifyRequested = false;
++    callOnMainThread([sourceBuffer = track.waitingSourceBuffer, trackID = track.id] {
++        if (RefPtr protectedSourceBuffer = sourceBuffer.get())
++            protectedSourceBuffer->readyForMoreSamples(trackID);
++    });
++}
++
++// #pragma mark - decoding thread
++
++void MediaPlayerPrivateHaikuMSE::startDecodeThread()
++{
++    if (m_thread >= 0)
++        return;
++    m_weakThis = WeakPtr { *this };
++    m_quit = false;
++    m_thread = spawn_thread(decodeThreadEntry, "MSE decode", B_DISPLAY_PRIORITY, this);
++    if (m_thread >= 0)
++        resume_thread(m_thread);
++}
++
++void MediaPlayerPrivateHaikuMSE::stopDecodeThread()
++{
++    if (m_thread < 0)
++        return;
++    m_quit = true;
++    status_t result;
++    wait_for_thread(m_thread, &result);
++    m_thread = -1;
++}
++
++status_t MediaPlayerPrivateHaikuMSE::decodeThreadEntry(void* cookie)
++{
++    static_cast<MediaPlayerPrivateHaikuMSE*>(cookie)->decodeLoop();
++    return B_OK;
++}
++
++void MediaPlayerPrivateHaikuMSE::decodeLoop()
++{
++    bigtime_t nextStatus = system_time() + 2000000;
++    while (!m_quit) {
++        bool worked = decodeAudio();
++        worked = decodeVideo() || worked;
++        presentVideo();
++        if (mseDebug() && system_time() >= nextStatus) {
++            nextStatus = system_time() + 2000000;
++            BAutolock locker(m_lock);
++            auto* video = activeTrack(HaikuTrackConfig::Kind::Video);
++            auto* audio = activeTrack(HaikuTrackConfig::Kind::Audio);
++            MSE_LOG("status: clock %.3f %s, queues v%zu a%zu, ring %.2f s, frames %zu, shown %u dropped %u\n",
++                clockLocked(), m_playing ? "playing" : "paused",
++                video ? video->queue.size() : 0, audio ? audio->queue.size() : 0,
++                m_audioRate && m_audioChannels ? double(m_ringFill) / m_audioChannels / m_audioRate : 0.0,
++                m_frames.size(), m_totalFrames, m_droppedFrames);
++        }
++        if (!worked)
++            snooze(5000);
++    }
++}
++
++bool MediaPlayerPrivateHaikuMSE::ensureSoundPlayer(const media_raw_audio_format& format)
++{
++    BAutolock locker(m_lock);
++    if (m_soundPlayer && m_audioRate == uint32_t(format.frame_rate) && m_audioChannels == format.channel_count)
++        return true;
++
++    BSoundPlayer* old = m_soundPlayer;
++    m_soundPlayer = nullptr;
++    if (old) {
++        m_lock.Unlock();
++        deleteHTML5SoundPlayer(old);
++        m_lock.Lock();
++    }
++
++    m_audioRate = uint32_t(format.frame_rate);
++    m_audioChannels = format.channel_count;
++    m_ring.resize(size_t(m_audioRate) * m_audioChannels * 2);
++    m_ringRead = m_ringFill = 0;
++
++    media_raw_audio_format output = media_raw_audio_format::wildcard;
++    output.frame_rate = format.frame_rate;
++    output.channel_count = format.channel_count;
++    output.format = media_raw_audio_format::B_AUDIO_FLOAT;
++    output.byte_order = B_MEDIA_HOST_ENDIAN;
++
++    m_soundPlayer = new BSoundPlayer(&output, "HTML5 Audio (MSE)", soundCallback, nullptr, this);
++    if (m_soundPlayer->InitCheck() != B_OK) {
++        MSE_LOG("sound player failed: %s\n", strerror(m_soundPlayer->InitCheck()));
++        delete m_soundPlayer;
++        m_soundPlayer = nullptr;
++        return false;
++    }
++    registerHTML5SoundPlayer(m_soundPlayer);
++    m_soundPlayer->SetVolume(m_muted ? 0 : m_volume);
++    m_soundPlayer->SetHasData(true);
++    if (m_playing)
++        m_soundPlayer->Start();
++    MSE_LOG("sound player %u Hz x%u\n", m_audioRate, m_audioChannels);
++    return true;
++}
++
++void MediaPlayerPrivateHaikuMSE::soundCallback(void* cookie, void* buffer, size_t size, const media_raw_audio_format& format)
++{
++    auto* player = static_cast<MediaPlayerPrivateHaikuMSE*>(cookie);
++    float* out = static_cast<float*>(buffer);
++    size_t wanted = size / sizeof(float);
++    size_t copied = 0;
++
++    if (player->m_lock.Lock()) {
++        if (player->m_playing && player->m_audioClock && player->m_audioChannels) {
++            size_t capacity = player->m_ring.size();
++            size_t count = std::min(wanted, player->m_ringFill);
++            count -= count % player->m_audioChannels;
++            for (size_t i = 0; i < count; i++)
++                out[i] = player->m_ring[(player->m_ringRead + i) % capacity];
++            player->m_ringRead = (player->m_ringRead + count) % capacity;
++            player->m_ringFill -= count;
++            player->m_audioNextTime += double(count / player->m_audioChannels) / player->m_audioRate;
++            copied = count;
++        }
++        player->m_lock.Unlock();
++    }
++    if (copied < wanted)
++        memset(out + copied, 0, (wanted - copied) * sizeof(float));
++}
++
++bool MediaPlayerPrivateHaikuMSE::decodeAudio()
++{
++    RefPtr<HaikuTrackConfig> config;
++    TrackID trackID = 0;
++    bool reset = false;
++    {
++        BAutolock locker(m_lock);
++        auto* track = activeTrack(HaikuTrackConfig::Kind::Audio);
++        if (!track)
++            return false;
++        if (track->flushRequested) {
++            track->flushRequested = false;
++            reset = true;
++        }
++        if (track->queue.size() < 2)
++            config = nullptr;
++        else
++            config = track->queue.first()->protectedConfig().ptr();
++        trackID = track->id;
++        // Keep about half a second of sound decoded, no more.
++        if (m_audioRate && m_ringFill >= size_t(m_audioRate) * m_audioChannels / 2)
++            config = nullptr;
++    }
++    if (reset) {
++        delete m_audioDecoder;
++        m_audioDecoder = nullptr;
++    }
++    if (!config)
++        return false;
++
++    if (m_audioDecoder && !m_audioDecoder->config().sameDecoderSetup(*config)) {
++        delete m_audioDecoder;
++        m_audioDecoder = nullptr;
++    }
++    if (!m_audioDecoder) {
++        auto* decoder = new HaikuSampleDecoder(*this, trackID, config.releaseNonNull());
++        status_t status = decoder->initialize();
++        if (status != B_OK) {
++            MSE_LOG("no audio decoder: %s\n", strerror(status));
++            delete decoder;
++            BAutolock locker(m_lock);
++            if (auto* track = activeTrack(HaikuTrackConfig::Kind::Audio))
++                track->queue.clear();
++            return false;
++        }
++        m_audioDecoder = decoder;
++        if (!ensureSoundPlayer(decoder->output().u.raw_audio))
++            return false;
++    }
++
++    const media_raw_audio_format& format = m_audioDecoder->output().u.raw_audio;
++    size_t bytes = format.buffer_size ? format.buffer_size : 4096 * format.channel_count * sizeof(float);
++    Vector<uint8_t> buffer(bytes);
++    int64 frames = 0;
++    media_header header;
++    media_decode_info info;
++    if (m_audioDecoder->Decode(buffer.data(), &frames, &header, &info) != B_OK || frames <= 0)
++        return false;
++
++    BAutolock locker(m_lock);
++    if (!m_audioChannels || format.channel_count != m_audioChannels)
++        return true;
++    double start = header.start_time / 1000000.0;
++    if (start + double(frames) / m_audioRate < m_seekFloor)
++        return true; // before the seek target
++    size_t samples = size_t(frames) * m_audioChannels;
++    size_t capacity = m_ring.size();
++    if (samples > capacity - m_ringFill)
++        samples = capacity - m_ringFill;
++    if (!m_audioClock && !m_ringFill) {
++        m_audioNextTime = std::max(start, m_seekFloor);
++        m_audioClock = true;
++    }
++    size_t write = (m_ringRead + m_ringFill) % capacity;
++    if (format.format == media_raw_audio_format::B_AUDIO_FLOAT) {
++        const float* in = reinterpret_cast<const float*>(buffer.data());
++        for (size_t i = 0; i < samples; i++)
++            m_ring[(write + i) % capacity] = in[i];
++    } else if (format.format == media_raw_audio_format::B_AUDIO_SHORT) {
++        const int16* in = reinterpret_cast<const int16*>(buffer.data());
++        for (size_t i = 0; i < samples; i++)
++            m_ring[(write + i) % capacity] = in[i] / 32768.0f;
++    } else
++        return true;
++    m_ringFill += samples;
++    return true;
++}
++
++bool MediaPlayerPrivateHaikuMSE::decodeVideo()
++{
++    RefPtr<HaikuTrackConfig> config;
++    TrackID trackID = 0;
++    bool reset = false;
++    BBitmap* bitmap = nullptr;
++    {
++        BAutolock locker(m_lock);
++        auto* track = activeTrack(HaikuTrackConfig::Kind::Video);
++        if (!track)
++            return false;
++        if (track->flushRequested) {
++            track->flushRequested = false;
++            reset = true;
++        }
++        trackID = track->id;
++        if (m_frames.size() < kDecodedFramesAhead && track->queue.size() >= kVideoDecodeMinimum)
++            config = track->queue.first()->protectedConfig().ptr();
++        if (config && !m_freeBitmaps.isEmpty())
++            bitmap = m_freeBitmaps.takeLast();
++    }
++    if (reset) {
++        delete m_videoDecoder;
++        m_videoDecoder = nullptr;
++    }
++    if (!config) {
++        if (bitmap) {
++            BAutolock locker(m_lock);
++            m_freeBitmaps.append(bitmap);
++        }
++        return false;
++    }
++
++    if (m_videoDecoder && !m_videoDecoder->config().sameDecoderSetup(*config)) {
++        delete m_videoDecoder;
++        m_videoDecoder = nullptr;
++    }
++    if (!m_videoDecoder) {
++        auto* decoder = new HaikuSampleDecoder(*this, trackID, config.releaseNonNull());
++        status_t status = decoder->initialize();
++        if (status != B_OK) {
++            MSE_LOG("no video decoder: %s\n", strerror(status));
++            delete decoder;
++            BAutolock locker(m_lock);
++            if (auto* track = activeTrack(HaikuTrackConfig::Kind::Video))
++                track->queue.clear();
++            if (bitmap)
++                m_freeBitmaps.append(bitmap);
++            return false;
++        }
++        m_videoDecoder = decoder;
++    }
++
++    const media_raw_video_format& format = m_videoDecoder->output().u.raw_video;
++    BRect bounds(0, 0, format.display.line_width - 1, format.display.line_count - 1);
++    if (bitmap && bitmap->Bounds() != bounds) {
++        delete bitmap;
++        bitmap = nullptr;
++    }
++    if (!bitmap)
++        bitmap = new BBitmap(bounds, B_RGB32);
++
++    int64 count = 0;
++    media_header header;
++    media_decode_info info;
++    status_t status = m_videoDecoder->Decode(bitmap->Bits(), &count, &header, &info);
++
++    BAutolock locker(m_lock);
++    if (status != B_OK || header.start_time / 1000000.0 < m_seekFloor - 0.001) {
++        m_freeBitmaps.append(bitmap);
++        return status == B_OK;
++    }
++    DecodedFrame frame { header.start_time, bitmap };
++    size_t index = m_frames.size();
++    while (index && m_frames[index - 1].time > frame.time)
++        index--;
++    m_frames.insert(index, frame);
++    return true;
++}
++
++void MediaPlayerPrivateHaikuMSE::presentVideo()
++{
++    bool repaint = false;
++    bool first = false;
++    {
++        BAutolock locker(m_lock);
++        if (m_frames.isEmpty())
++            return;
++        size_t show = notFound;
++        if (m_showFirstFrame) {
++            show = 0;
++            first = true;
++            m_showFirstFrame = false;
++        } else if (m_playing) {
++            bigtime_t now = bigtime_t(clockLocked() * 1000000);
++            for (size_t i = 0; i < m_frames.size() && m_frames[i].time <= now; i++)
++                show = i;
++            if (show != notFound) {
++                m_totalFrames += show + 1;
++                m_droppedFrames += show; // decoded too late to be seen
++            }
++        }
++        if (show == notFound)
++            return;
++        for (size_t i = 0; i < show; i++)
++            m_freeBitmaps.append(m_frames[i].bitmap);
++        if (m_displayBitmap)
++            m_freeBitmaps.append(m_displayBitmap);
++        m_displayBitmap = m_frames[show].bitmap;
++        m_frames.remove(0, show + 1);
++        repaint = true;
++    }
++    if (!repaint)
++        return;
++    callOnMainThread([weakThis = m_weakThis, first] {
++        if (!weakThis)
++            return;
++        if (auto player = weakThis->m_player.get()) {
++            if (first)
++                player->firstVideoFrameAvailable();
++            player->repaint();
++        }
++    });
++}
++
++} // namespace WebCore
++
++#endif
+diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaikuMSE.h haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaikuMSE.h
+--- orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaikuMSE.h	1970-01-01 00:00:00.000000000 +0000
++++ haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaikuMSE.h
+@@ -0,0 +1,193 @@
++/*
++ * Copyright (C) 2026 rainygirl
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Library General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ */
++
++#pragma once
++
++#if ENABLE(MEDIA_SOURCE)
++
++#include "HaikuMSESample.h"
++#include "MediaPlayerPrivate.h"
++#include "PlatformTimeRanges.h"
++#include <wtf/Deque.h>
++#include <wtf/HashMap.h>
++#include <wtf/RefCounted.h>
++#include <wtf/ThreadSafeWeakPtr.h>
++#include <wtf/Vector.h>
++#include <wtf/WeakPtr.h>
++
++#include <Locker.h>
++#include <OS.h>
++
++class BBitmap;
++class BSoundPlayer;
++struct media_raw_audio_format;
++
++namespace WebCore {
++
++class MediaSourcePrivateHaiku;
++class SourceBufferPrivateHaiku;
++class HaikuSampleDecoder;
++
++// The Media Source Extensions engine. WebCore's SourceBuffer keeps the
++// buffered frames and hands them over in decode order through
++// enqueueSample(); a decoding thread runs them through the Media Kit
++// (BMediaDecoder -- the GMA500's H.264 add-on where there is one, the ffmpeg
++// plugin otherwise), keeps a little decoded audio ahead of a BSoundPlayer,
++// and shows each video frame when the audio clock reaches it.
++class MediaPlayerPrivateHaikuMSE final
++    : public MediaPlayerPrivateInterface
++    , public RefCounted<MediaPlayerPrivateHaikuMSE>
++    , public CanMakeWeakPtr<MediaPlayerPrivateHaikuMSE> {
++public:
++    void ref() const final { RefCounted::ref(); }
++    void deref() const final { RefCounted::deref(); }
++
++    explicit MediaPlayerPrivateHaikuMSE(MediaPlayer*);
++    ~MediaPlayerPrivateHaikuMSE();
++
++    static void registerMediaEngine(MediaEngineRegistrar);
++    static void getSupportedTypes(HashSet<String>&);
++    static MediaPlayer::SupportsType supportsType(const MediaEngineSupportParameters&);
++
++    constexpr MediaPlayerType mediaPlayerType() const final { return MediaPlayerType::HaikuMSE; }
++
++    // From MediaSourcePrivateHaiku, on the main thread.
++    void durationChanged();
++    void setReadyState(MediaPlayer::ReadyState);
++    void setNetworkState(MediaPlayer::NetworkState);
++    void notifyActiveSourceBuffersChanged();
++    void setTrackConfig(TrackID, Ref<HaikuTrackConfig>&&);
++    void flushTrack(TrackID);
++    void enqueueSample(Ref<HaikuMediaSample>&&, TrackID);
++    bool isReadyForMoreSamples(TrackID);
++    void notifyWhenReadyForMoreSamples(TrackID, SourceBufferPrivateHaiku&);
++
++    MediaPlayer::ReadyState readyState() const final { return m_readyState; }
++
++private:
++    friend class HaikuSampleDecoder;
++
++    void load(const String&) final;
++    void load(const URL&, const ContentType&, MediaSourcePrivateClient&) final;
++#if ENABLE(MEDIA_STREAM)
++    void load(MediaStreamPrivate&) final { }
++#endif
++    void cancelLoad() final;
++    void play() final;
++    void pause() final;
++    FloatSize naturalSize() const final;
++    bool hasVideo() const final;
++    bool hasAudio() const final;
++    void setPageIsVisible(bool) final { }
++    MediaTime currentTime() const final;
++    bool timeIsProgressing() const final;
++    void seekToTarget(const SeekTarget&) final;
++    bool seeking() const final { return !!m_lastSeekTarget; }
++    bool paused() const final { return !m_playing; }
++    void setVolume(float) final;
++    void setMuted(bool) final;
++    MediaPlayer::NetworkState networkState() const final { return m_networkState; }
++    MediaTime maxTimeSeekable() const final;
++    const PlatformTimeRanges& buffered() const final { return PlatformTimeRanges::emptyRanges(); }
++    bool didLoadingProgress() const final;
++    void paint(GraphicsContext&, const FloatRect&) final;
++    MediaTime duration() const final;
++    std::optional<VideoPlaybackQualityMetrics> videoPlaybackQualityMetrics() final;
++    DestinationColorSpace colorSpace() final;
++
++    struct Track {
++        TrackID id { 0 };
++        HaikuTrackConfig::Kind kind { HaikuTrackConfig::Kind::Video };
++        Deque<Ref<HaikuMediaSample>> queue;
++        ThreadSafeWeakPtr<SourceBufferPrivateHaiku> waitingSourceBuffer;
++        bool notifyRequested { false };
++        bool flushRequested { false };
++    };
++
++    struct DecodedFrame {
++        bigtime_t time { 0 };
++        BBitmap* bitmap { nullptr };
++    };
++
++    // Everything below is shared with the decoding and sound threads and is
++    // guarded by m_lock.
++    Track* trackFor(TrackID);
++    Track* activeTrack(HaikuTrackConfig::Kind);
++    double clockLocked() const;
++    void startDecodeThread();
++    void stopDecodeThread();
++    static status_t decodeThreadEntry(void*);
++    void decodeLoop();
++    bool decodeAudio();
++    bool decodeVideo();
++    void presentVideo();
++    void requestMoreSamplesIfNeeded(Track&);
++    bool ensureSoundPlayer(const media_raw_audio_format&);
++    static void soundCallback(void*, void*, size_t, const media_raw_audio_format&);
++
++    ThreadSafeWeakPtr<MediaPlayer> m_player;
++    RefPtr<MediaSourcePrivateHaiku> m_mediaSourcePrivate;
++    MediaPlayer::ReadyState m_readyState { MediaPlayer::ReadyState::HaveNothing };
++    MediaPlayer::NetworkState m_networkState { MediaPlayer::NetworkState::Empty };
++    std::optional<SeekTarget> m_lastSeekTarget;
++    mutable bool m_receivedData { false };
++
++    mutable BLocker m_lock { "MSE player" };
++    HashMap<TrackID, std::unique_ptr<Track>, WTF::IntHash<TrackID>, WTF::UnsignedWithZeroKeyHashTraits<TrackID>> m_tracks;
++    TrackID m_videoTrackID { 0 };
++    TrackID m_audioTrackID { 0 };
++    bool m_haveVideoTrack { false };
++    bool m_haveAudioTrack { false };
++    RefPtr<HaikuTrackConfig> m_videoConfig;
++
++    bool m_playing { false };
++    float m_volume { 1 };
++    bool m_muted { false };
++
++    // The clock. With audio it is the presentation time of the next audio
++    // frame the sound player will take; without, system time since play().
++    double m_clockBase { 0 };
++    bigtime_t m_clockStarted { 0 };
++    bool m_audioClock { false };
++    double m_audioNextTime { 0 };
++    // Frames and sound from before the last seek target are not shown.
++    double m_seekFloor { 0 };
++    bool m_seeking { false };
++
++    // Decoded audio, interleaved float.
++    Vector<float> m_ring;
++    size_t m_ringRead { 0 };
++    size_t m_ringFill { 0 };
++    uint32_t m_audioRate { 0 };
++    uint32_t m_audioChannels { 0 };
++
++    Vector<DecodedFrame> m_frames;
++    Vector<BBitmap*> m_freeBitmaps;
++    BBitmap* m_displayBitmap { nullptr };
++    bool m_showFirstFrame { true };
++    uint32_t m_totalFrames { 0 };
++    uint32_t m_droppedFrames { 0 };
++
++    WeakPtr<MediaPlayerPrivateHaikuMSE> m_weakThis; // made on the main thread, copied by others
++    thread_id m_thread { -1 };
++    volatile bool m_quit { false };
++
++    // Owned by the decoding thread.
++    HaikuSampleDecoder* m_videoDecoder { nullptr };
++    HaikuSampleDecoder* m_audioDecoder { nullptr };
++    BSoundPlayer* m_soundPlayer { nullptr };
++};
++
++} // namespace WebCore
++
++SPECIALIZE_TYPE_TRAITS_BEGIN(WebCore::MediaPlayerPrivateHaikuMSE)
++static bool isType(const WebCore::MediaPlayerPrivateInterface& player) { return player.mediaPlayerType() == WebCore::MediaPlayerType::HaikuMSE; }
++SPECIALIZE_TYPE_TRAITS_END()
++
++#endif
+diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaSourcePrivateHaiku.cpp haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaSourcePrivateHaiku.cpp
+--- orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaSourcePrivateHaiku.cpp	1970-01-01 00:00:00.000000000 +0000
++++ haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaSourcePrivateHaiku.cpp
+@@ -0,0 +1,146 @@
++/*
++ * Copyright (C) 2026 rainygirl
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Library General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ */
++
++#include "config.h"
++#include "MediaSourcePrivateHaiku.h"
++
++#if ENABLE(MEDIA_SOURCE)
++
++#include "ContentType.h"
++#include "MediaPlayerPrivateHaikuMSE.h"
++#include "MediaSourcePrivateClient.h"
++#include "SourceBufferPrivateHaiku.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++
++namespace WebCore {
++
++static bool mseDebug()
++{
++    static const bool debug = getenv("WEBKIT_MEDIA_DEBUG") != nullptr;
++    return debug;
++}
++
++#define MSE_LOG(...) do { if (mseDebug()) fprintf(stderr, "[mse] " __VA_ARGS__); } while (0)
++
++Ref<MediaSourcePrivateHaiku> MediaSourcePrivateHaiku::create(MediaPlayerPrivateHaikuMSE& player, MediaSourcePrivateClient& client)
++{
++    auto source = adoptRef(*new MediaSourcePrivateHaiku(player, client));
++    client.setPrivateAndOpen(source.copyRef());
++    return source;
++}
++
++MediaSourcePrivateHaiku::MediaSourcePrivateHaiku(MediaPlayerPrivateHaikuMSE& player, MediaSourcePrivateClient& client)
++    : MediaSourcePrivate(client)
++    , m_player(player)
++{
++}
++
++MediaSourcePrivateHaiku::~MediaSourcePrivateHaiku() = default;
++
++RefPtr<MediaPlayerPrivateInterface> MediaSourcePrivateHaiku::player() const
++{
++    return m_player.get();
++}
++
++RefPtr<MediaPlayerPrivateHaikuMSE> MediaSourcePrivateHaiku::haikuPlayer() const
++{
++    return m_player.get();
++}
++
++void MediaSourcePrivateHaiku::setPlayer(MediaPlayerPrivateInterface* player)
++{
++    m_player = downcast<MediaPlayerPrivateHaikuMSE>(player);
++}
++
++MediaSourcePrivate::AddStatus MediaSourcePrivateHaiku::addSourceBuffer(const ContentType& type, RefPtr<SourceBufferPrivate>& outPrivate)
++{
++    MediaEngineSupportParameters parameters;
++    parameters.isMediaSource = true;
++    parameters.type = type;
++    if (MediaPlayerPrivateHaikuMSE::supportsType(parameters) == MediaPlayer::SupportsType::IsNotSupported) {
++        MSE_LOG("addSourceBuffer %s: not supported\n", type.raw().utf8().data());
++        return AddStatus::NotSupported;
++    }
++    MSE_LOG("addSourceBuffer %s\n", type.raw().utf8().data());
++
++    m_sourceBuffers.append(SourceBufferPrivateHaiku::create(*this, m_nextSourceBufferIndex++));
++    outPrivate = m_sourceBuffers.last();
++    outPrivate->setMediaSourceDuration(duration());
++    return AddStatus::Ok;
++}
++
++void MediaSourcePrivateHaiku::durationChanged(const MediaTime& duration)
++{
++    MediaSourcePrivate::durationChanged(duration);
++    MSE_LOG("duration %.3f\n", duration.toDouble());
++    if (RefPtr player = haikuPlayer())
++        player->durationChanged();
++}
++
++void MediaSourcePrivateHaiku::markEndOfStream(EndOfStreamStatus status)
++{
++    if (RefPtr player = haikuPlayer(); player && status == EndOfStreamStatus::NoError)
++        player->setNetworkState(MediaPlayer::NetworkState::Loaded);
++    MediaSourcePrivate::markEndOfStream(status);
++}
++
++MediaPlayer::ReadyState MediaSourcePrivateHaiku::mediaPlayerReadyState() const
++{
++    if (RefPtr player = haikuPlayer())
++        return player->readyState();
++    return MediaPlayer::ReadyState::HaveNothing;
++}
++
++void MediaSourcePrivateHaiku::setMediaPlayerReadyState(MediaPlayer::ReadyState readyState)
++{
++    if (RefPtr player = haikuPlayer())
++        player->setReadyState(readyState);
++}
++
++void MediaSourcePrivateHaiku::notifyActiveSourceBuffersChanged()
++{
++    if (RefPtr player = haikuPlayer())
++        player->notifyActiveSourceBuffersChanged();
++}
++
++void MediaSourcePrivateHaiku::setTrackConfig(TrackID trackID, Ref<HaikuTrackConfig>&& config)
++{
++    if (RefPtr player = haikuPlayer())
++        player->setTrackConfig(trackID, WTFMove(config));
++}
++
++void MediaSourcePrivateHaiku::flushTrack(TrackID trackID)
++{
++    if (RefPtr player = haikuPlayer())
++        player->flushTrack(trackID);
++}
++
++void MediaSourcePrivateHaiku::enqueueSample(Ref<HaikuMediaSample>&& sample, TrackID trackID)
++{
++    if (RefPtr player = haikuPlayer())
++        player->enqueueSample(WTFMove(sample), trackID);
++}
++
++bool MediaSourcePrivateHaiku::isReadyForMoreSamples(TrackID trackID)
++{
++    RefPtr player = haikuPlayer();
++    return player && player->isReadyForMoreSamples(trackID);
++}
++
++void MediaSourcePrivateHaiku::notifyWhenReadyForMoreSamples(TrackID trackID, SourceBufferPrivateHaiku& sourceBuffer)
++{
++    if (RefPtr player = haikuPlayer())
++        player->notifyWhenReadyForMoreSamples(trackID, sourceBuffer);
++}
++
++} // namespace WebCore
++
++#endif
+diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaSourcePrivateHaiku.h haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaSourcePrivateHaiku.h
+--- orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaSourcePrivateHaiku.h	1970-01-01 00:00:00.000000000 +0000
++++ haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaSourcePrivateHaiku.h
+@@ -0,0 +1,62 @@
++/*
++ * Copyright (C) 2026 rainygirl
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Library General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ */
++
++#pragma once
++
++#if ENABLE(MEDIA_SOURCE)
++
++#include "HaikuMSESample.h"
++#include "MediaSourcePrivate.h"
++#include <wtf/WeakPtr.h>
++
++namespace WebCore {
++
++class MediaPlayerPrivateHaikuMSE;
++class SourceBufferPrivateHaiku;
++
++class MediaSourcePrivateHaiku final : public MediaSourcePrivate {
++public:
++    static Ref<MediaSourcePrivateHaiku> create(MediaPlayerPrivateHaikuMSE&, MediaSourcePrivateClient&);
++    ~MediaSourcePrivateHaiku();
++
++    constexpr MediaPlatformType platformType() const final { return MediaPlatformType::Haiku; }
++
++    RefPtr<MediaPlayerPrivateInterface> player() const final;
++    void setPlayer(MediaPlayerPrivateInterface*) final;
++
++    // Between the source buffers and the player.
++    void setTrackConfig(TrackID, Ref<HaikuTrackConfig>&&);
++    void flushTrack(TrackID);
++    void enqueueSample(Ref<HaikuMediaSample>&&, TrackID);
++    bool isReadyForMoreSamples(TrackID);
++    void notifyWhenReadyForMoreSamples(TrackID, SourceBufferPrivateHaiku&);
++
++private:
++    MediaSourcePrivateHaiku(MediaPlayerPrivateHaikuMSE&, MediaSourcePrivateClient&);
++
++    AddStatus addSourceBuffer(const ContentType&, RefPtr<SourceBufferPrivate>&) final;
++    void durationChanged(const MediaTime&) final;
++    void markEndOfStream(EndOfStreamStatus) final;
++    MediaPlayer::ReadyState mediaPlayerReadyState() const final;
++    void setMediaPlayerReadyState(MediaPlayer::ReadyState) final;
++    void notifyActiveSourceBuffersChanged() final;
++
++    RefPtr<MediaPlayerPrivateHaikuMSE> haikuPlayer() const;
++
++    WeakPtr<MediaPlayerPrivateHaikuMSE> m_player;
++    uint32_t m_nextSourceBufferIndex { 1 };
++};
++
++} // namespace WebCore
++
++SPECIALIZE_TYPE_TRAITS_BEGIN(WebCore::MediaSourcePrivateHaiku)
++static bool isType(const WebCore::MediaSourcePrivate& mediaSource) { return mediaSource.platformType() == WebCore::MediaPlatformType::Haiku; }
++SPECIALIZE_TYPE_TRAITS_END()
++
++#endif
+diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/SourceBufferPrivateHaiku.cpp haikuwebkit/Source/WebCore/platform/graphics/haiku/SourceBufferPrivateHaiku.cpp
+--- orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/SourceBufferPrivateHaiku.cpp	1970-01-01 00:00:00.000000000 +0000
++++ haikuwebkit/Source/WebCore/platform/graphics/haiku/SourceBufferPrivateHaiku.cpp
+@@ -0,0 +1,706 @@
++/*
++ * Copyright (C) 2026 rainygirl
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Library General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ */
++
++#include "config.h"
++#include "SourceBufferPrivateHaiku.h"
++
++#if ENABLE(MEDIA_SOURCE)
++
++#include "AudioTrackPrivate.h"
++#include "ContentType.h"
++#include "MediaDescription.h"
++#include "MediaPlayerPrivateHaikuMSE.h"
++#include "MediaSourcePrivateHaiku.h"
++#include "SharedBuffer.h"
++#include "VideoTrackPrivate.h"
++#include <wtf/NativePromise.h>
++
++#include <functional>
++#include <stdio.h>
++#include <stdlib.h>
++
++namespace WebCore {
++
++static bool mseDebug()
++{
++    static const bool debug = getenv("WEBKIT_MEDIA_DEBUG") != nullptr;
++    return debug;
++}
++
++#define MSE_LOG(...) do { if (mseDebug()) fprintf(stderr, "[mse] " __VA_ARGS__); } while (0)
++
++namespace {
++
++class HaikuVideoTrackPrivate final : public VideoTrackPrivate {
++public:
++    static Ref<HaikuVideoTrackPrivate> create(TrackID id) { return adoptRef(*new HaikuVideoTrackPrivate(id)); }
++    TrackID id() const final { return m_id; }
++
++private:
++    explicit HaikuVideoTrackPrivate(TrackID id) : m_id(id) { }
++    TrackID m_id;
++};
++
++class HaikuAudioTrackPrivate final : public AudioTrackPrivate {
++public:
++    static Ref<HaikuAudioTrackPrivate> create(TrackID id) { return adoptRef(*new HaikuAudioTrackPrivate(id)); }
++    TrackID id() const final { return m_id; }
++
++private:
++    explicit HaikuAudioTrackPrivate(TrackID id) : m_id(id) { }
++    TrackID m_id;
++};
++
++class HaikuMediaDescription final : public MediaDescription {
++public:
++    static Ref<HaikuMediaDescription> create(const HaikuTrackConfig& config)
++    {
++        return adoptRef(*new HaikuMediaDescription(config));
++    }
++    bool isVideo() const final { return m_kind == HaikuTrackConfig::Kind::Video; }
++    bool isAudio() const final { return m_kind == HaikuTrackConfig::Kind::Audio; }
++    bool isText() const final { return false; }
++
++private:
++    explicit HaikuMediaDescription(const HaikuTrackConfig& config)
++        : MediaDescription(config.codec.isolatedCopy())
++        , m_kind(config.kind)
++    {
++    }
++    HaikuTrackConfig::Kind m_kind;
++};
++
++// Big-endian readers over a bounded range. Every read is checked against the
++// end; a short box makes the whole parse fail rather than read past it.
++class Reader {
++public:
++    Reader(const uint8_t* data, size_t size) : m_data(data), m_size(size) { }
++
++    bool has(size_t n) const { return m_offset + n <= m_size; }
++    size_t offset() const { return m_offset; }
++    size_t remaining() const { return m_size - m_offset; }
++    const uint8_t* current() const { return m_data + m_offset; }
++    void skip(size_t n) { m_offset = std::min(m_size, m_offset + n); }
++    void seek(size_t n) { m_offset = std::min(m_size, n); }
++
++    bool u8(uint8_t& v) { if (!has(1)) return false; v = m_data[m_offset++]; return true; }
++    bool u16(uint16_t& v)
++    {
++        if (!has(2)) return false;
++        v = (uint16_t(m_data[m_offset]) << 8) | m_data[m_offset + 1];
++        m_offset += 2;
++        return true;
++    }
++    bool u32(uint32_t& v)
++    {
++        if (!has(4)) return false;
++        v = (uint32_t(m_data[m_offset]) << 24) | (uint32_t(m_data[m_offset + 1]) << 16)
++            | (uint32_t(m_data[m_offset + 2]) << 8) | m_data[m_offset + 3];
++        m_offset += 4;
++        return true;
++    }
++    bool u64(uint64_t& v)
++    {
++        uint32_t hi, lo;
++        if (!u32(hi) || !u32(lo)) return false;
++        v = (uint64_t(hi) << 32) | lo;
++        return true;
++    }
++
++private:
++    const uint8_t* m_data;
++    size_t m_size;
++    size_t m_offset { 0 };
++};
++
++static uint32_t fourcc(const char* s)
++{
++    return (uint32_t(uint8_t(s[0])) << 24) | (uint32_t(uint8_t(s[1])) << 16)
++        | (uint32_t(uint8_t(s[2])) << 8) | uint8_t(s[3]);
++}
++
++static String fourccString(uint32_t type)
++{
++    char s[5] = { char(type >> 24), char(type >> 16), char(type >> 8), char(type), 0 };
++    return String::fromLatin1(s);
++}
++
++// Walks the child boxes of a container: calls the function with each child's
++// type and payload. Returns false on a malformed box.
++template<typename Function>
++static bool forEachBox(const uint8_t* data, size_t size, Function&& function)
++{
++    Reader reader(data, size);
++    while (reader.remaining() >= 8) {
++        size_t start = reader.offset();
++        uint32_t size32, type;
++        reader.u32(size32);
++        reader.u32(type);
++        uint64_t boxSize = size32;
++        size_t header = 8;
++        if (size32 == 1) {
++            if (!reader.u64(boxSize))
++                return false;
++            header = 16;
++        } else if (!size32)
++            boxSize = size - start;
++        if (boxSize < header || start + boxSize > size)
++            return false;
++        if (!function(type, data + start + header, size_t(boxSize - header)))
++            return false;
++        reader.seek(start + boxSize);
++    }
++    return true;
++}
++
++// The AudioSpecificConfig inside an esds box: ES_Descriptor (tag 3) ->
++// DecoderConfigDescriptor (tag 4) -> DecoderSpecificInfo (tag 5).
++static bool parseESDS(const uint8_t* data, size_t size, Vector<uint8_t>& out)
++{
++    Reader reader(data, size);
++    reader.skip(4); // version and flags
++    auto descriptor = [&](uint8_t& tag, size_t& length) {
++        if (!reader.u8(tag))
++            return false;
++        length = 0;
++        for (int i = 0; i < 4; i++) {
++            uint8_t byte;
++            if (!reader.u8(byte))
++                return false;
++            length = (length << 7) | (byte & 0x7f);
++            if (!(byte & 0x80))
++                break;
++        }
++        return true;
++    };
++    uint8_t tag;
++    size_t length;
++    if (!descriptor(tag, length) || tag != 3)
++        return false;
++    reader.skip(2); // ES_ID
++    uint8_t flags;
++    if (!reader.u8(flags))
++        return false;
++    if (flags & 0x80)
++        reader.skip(2);
++    if (flags & 0x40) {
++        uint8_t urlLength;
++        if (!reader.u8(urlLength))
++            return false;
++        reader.skip(urlLength);
++    }
++    if (flags & 0x20)
++        reader.skip(2);
++    if (!descriptor(tag, length) || tag != 4)
++        return false;
++    reader.skip(13); // objectTypeIndication .. avgBitrate
++    if (!descriptor(tag, length) || tag != 5 || !reader.has(length))
++        return false;
++    out.append(std::span<const uint8_t>(reader.current(), length));
++    return true;
++}
++
++} // namespace
++
++Ref<SourceBufferPrivateHaiku> SourceBufferPrivateHaiku::create(MediaSourcePrivateHaiku& parent, uint32_t index)
++{
++    return adoptRef(*new SourceBufferPrivateHaiku(parent, index));
++}
++
++SourceBufferPrivateHaiku::SourceBufferPrivateHaiku(MediaSourcePrivateHaiku& parent, uint32_t index)
++    : SourceBufferPrivate(parent)
++    , m_index(index)
++{
++}
++
++SourceBufferPrivateHaiku::~SourceBufferPrivateHaiku() = default;
++
++RefPtr<MediaSourcePrivateHaiku> SourceBufferPrivateHaiku::mediaSourcePrivate() const
++{
++    return downcast<MediaSourcePrivateHaiku>(m_mediaSource.get());
++}
++
++bool SourceBufferPrivateHaiku::supportsContainer(const String& container)
++{
++    return container == "video/mp4"_s || container == "audio/mp4"_s;
++}
++
++bool SourceBufferPrivateHaiku::canSwitchToType(const ContentType& type)
++{
++    return supportsContainer(type.containerType().convertToASCIILowercase());
++}
++
++Ref<MediaPromise> SourceBufferPrivateHaiku::appendInternal(Ref<SharedBuffer>&& data)
++{
++    m_input.appendVector(data->extractData());
++    MSE_LOG("append: %zu bytes buffered\n", m_input.size());
++    if (!parseBoxes()) {
++        MSE_LOG("parse error, dropping %zu bytes\n", m_input.size());
++        m_input.clear();
++        return MediaPromise::createAndReject(PlatformMediaError::ParsingError);
++    }
++    return MediaPromise::createAndResolve();
++}
++
++void SourceBufferPrivateHaiku::resetParserStateInternal()
++{
++    m_input.clear();
++}
++
++// Consumes every complete top-level box in m_input. A moof is only consumed
++// together with the mdat that follows it, since its sample offsets point
++// into that mdat.
++bool SourceBufferPrivateHaiku::parseBoxes()
++{
++    size_t position = 0;
++    auto boxAt = [&](size_t at, uint32_t& type, uint64_t& size, size_t& header) {
++        if (m_input.size() - at < 8)
++            return false;
++        Reader reader(m_input.data() + at, m_input.size() - at);
++        uint32_t size32;
++        reader.u32(size32);
++        reader.u32(type);
++        size = size32;
++        header = 8;
++        if (size32 == 1) {
++            if (!reader.u64(size))
++                return false;
++            header = 16;
++        }
++        return true;
++    };
++
++    bool ok = true;
++    while (true) {
++        uint32_t type;
++        uint64_t size;
++        size_t header;
++        if (!boxAt(position, type, size, header))
++            break;
++        if (size < header) {
++            ok = false;
++            break;
++        }
++        if (position + size > m_input.size())
++            break;
++
++        const uint8_t* payload = m_input.data() + position + header;
++        size_t payloadSize = size_t(size - header);
++
++        if (type == fourcc("moov")) {
++            if (!parseMovie(payload, payloadSize)) {
++                ok = false;
++                break;
++            }
++            position += size;
++        } else if (type == fourcc("moof")) {
++            size_t next = position + size;
++            uint32_t nextType;
++            uint64_t nextSize;
++            size_t nextHeader;
++            // Boxes between the moof and its mdat are rare but legal; wait
++            // for the mdat itself.
++            if (!boxAt(next, nextType, nextSize, nextHeader))
++                break;
++            if (nextType != fourcc("mdat")) {
++                MSE_LOG("moof followed by %s, skipped\n", fourccString(nextType).utf8().data());
++                position = next;
++                continue;
++            }
++            if (next + nextSize > m_input.size())
++                break;
++            if (!parseFragment(m_input.data() + position, size_t(size),
++                m_input.data() + next + nextHeader, size_t(nextSize - nextHeader),
++                size_t(size + nextHeader))) {
++                ok = false;
++                break;
++            }
++            position = next + nextSize;
++        } else {
++            // ftyp, styp, sidx, emsg, prft, free, a stray mdat: nothing here
++            // that playback needs.
++            position += size;
++        }
++    }
++
++    if (position)
++        m_input.remove(0, position);
++    return ok;
++}
++
++bool SourceBufferPrivateHaiku::parseMovie(const uint8_t* data, size_t size)
++{
++    InitializationSegment segment;
++    MediaTime duration = MediaTime::invalidTime();
++
++    bool ok = forEachBox(data, size, [&](uint32_t type, const uint8_t* payload, size_t payloadSize) {
++        if (type == fourcc("mvhd")) {
++            Reader reader(payload, payloadSize);
++            uint8_t version;
++            reader.u8(version);
++            reader.skip(3);
++            uint32_t timescale = 0;
++            uint64_t length = 0;
++            if (version == 1) {
++                reader.skip(16);
++                reader.u32(timescale);
++                reader.u64(length);
++            } else {
++                uint32_t length32 = 0;
++                reader.skip(8);
++                reader.u32(timescale);
++                reader.u32(length32);
++                length = length32;
++            }
++            // A live stream's movie says 0 or all ones: unknown.
++            if (timescale && length && length != 0xffffffff && length != 0xffffffffffffffffull)
++                duration = MediaTime(length, timescale);
++            return true;
++        }
++        if (type == fourcc("trak")) {
++            uint32_t mp4TrackID = 0;
++            auto config = HaikuTrackConfig::create();
++            if (!parseTrack(payload, payloadSize, mp4TrackID, config))
++                return true; // a track we cannot play is left out, not fatal
++            TrackID id = trackIDFor(mp4TrackID);
++            MSE_LOG("track %u: %s, %ux%u, %u Hz x%u, %zu bytes of codec config\n", mp4TrackID,
++                config->codec.utf8().data(), config->width, config->height, config->sampleRate,
++                config->channels, config->codecPrivate.size());
++            if (config->kind == HaikuTrackConfig::Kind::Video) {
++                InitializationSegment::VideoTrackInformation info;
++                info.track = HaikuVideoTrackPrivate::create(id);
++                info.description = HaikuMediaDescription::create(config);
++                segment.videoTracks.append(WTFMove(info));
++            } else {
++                InitializationSegment::AudioTrackInformation info;
++                info.track = HaikuAudioTrackPrivate::create(id);
++                info.description = HaikuMediaDescription::create(config);
++                segment.audioTracks.append(WTFMove(info));
++            }
++            m_tracks.set(mp4TrackID, WTFMove(config));
++            return true;
++        }
++        if (type == fourcc("mvex")) {
++            return forEachBox(payload, payloadSize, [&](uint32_t childType, const uint8_t* child, size_t childSize) {
++                if (childType != fourcc("trex"))
++                    return true;
++                Reader reader(child, childSize);
++                reader.skip(4);
++                uint32_t trackID, descriptionIndex;
++                TrackDefaults defaults;
++                if (!reader.u32(trackID) || !reader.u32(descriptionIndex) || !reader.u32(defaults.duration)
++                    || !reader.u32(defaults.size) || !reader.u32(defaults.flags))
++                    return false;
++                m_trackDefaults.set(trackID, defaults);
++                return true;
++            });
++        }
++        return true;
++    });
++    if (!ok)
++        return false;
++
++    segment.duration = duration.isValid() ? duration : MediaTime::positiveInfiniteTime();
++    if (RefPtr mediaSource = mediaSourcePrivate()) {
++        for (auto& entry : m_tracks)
++            mediaSource->setTrackConfig(trackIDFor(entry.key), entry.value.copyRef());
++    }
++    didReceiveInitializationSegment(WTFMove(segment));
++    return true;
++}
++
++bool SourceBufferPrivateHaiku::parseTrack(const uint8_t* data, size_t size, uint32_t& trackID, Ref<HaikuTrackConfig>& config)
++{
++    bool haveHandler = false;
++    bool supported = false;
++
++    auto parseSampleEntry = [&](uint32_t type, const uint8_t* entry, size_t entrySize) {
++        Reader reader(entry, entrySize);
++        if (type == fourcc("avc1") || type == fourcc("avc3")) {
++            config->kind = HaikuTrackConfig::Kind::Video;
++            config->codec = fourccString(type);
++            reader.skip(24);
++            uint16_t width, height;
++            if (!reader.u16(width) || !reader.u16(height))
++                return false;
++            config->width = width;
++            config->height = height;
++            reader.seek(78);
++            return forEachBox(reader.current(), reader.remaining(), [&](uint32_t childType, const uint8_t* child, size_t childSize) {
++                if (childType == fourcc("avcC")) {
++                    config->codecPrivate.append(std::span<const uint8_t>(child, childSize));
++                    supported = true;
++                }
++                return true;
++            });
++        }
++        if (type == fourcc("mp4a")) {
++            config->kind = HaikuTrackConfig::Kind::Audio;
++            config->codec = "mp4a"_s;
++            reader.skip(16);
++            uint16_t channels, sampleSize;
++            uint32_t rate;
++            if (!reader.u16(channels) || !reader.u16(sampleSize))
++                return false;
++            reader.skip(4);
++            if (!reader.u32(rate))
++                return false;
++            config->channels = channels;
++            config->sampleRate = rate >> 16;
++            return forEachBox(reader.current(), reader.remaining(), [&](uint32_t childType, const uint8_t* child, size_t childSize) {
++                if (childType == fourcc("esds") && parseESDS(child, childSize, config->codecPrivate))
++                    supported = true;
++                return true;
++            });
++        }
++        MSE_LOG("sample entry %s is not supported\n", fourccString(type).utf8().data());
++        return true;
++    };
++
++    std::function<bool(uint32_t, const uint8_t*, size_t)> walk;
++    walk = [&](uint32_t type, const uint8_t* payload, size_t payloadSize) -> bool {
++        if (type == fourcc("tkhd")) {
++            Reader reader(payload, payloadSize);
++            uint8_t version;
++            reader.u8(version);
++            reader.skip(3 + (version == 1 ? 16 : 8));
++            return reader.u32(trackID);
++        }
++        if (type == fourcc("mdhd")) {
++            Reader reader(payload, payloadSize);
++            uint8_t version;
++            reader.u8(version);
++            reader.skip(3 + (version == 1 ? 16 : 8));
++            return reader.u32(config->timescale) && config->timescale;
++        }
++        if (type == fourcc("hdlr")) {
++            Reader reader(payload, payloadSize);
++            reader.skip(8);
++            uint32_t handler;
++            if (!reader.u32(handler))
++                return false;
++            haveHandler = handler == fourcc("vide") || handler == fourcc("soun");
++            return true;
++        }
++        if (type == fourcc("stsd")) {
++            Reader reader(payload, payloadSize);
++            reader.skip(8); // version, flags, entry count; the first entry is used
++            return forEachBox(reader.current(), reader.remaining(), [&](uint32_t entryType, const uint8_t* entry, size_t entrySize) {
++                return parseSampleEntry(entryType, entry, entrySize);
++            });
++        }
++        if (type == fourcc("mdia") || type == fourcc("minf") || type == fourcc("stbl"))
++            return forEachBox(payload, payloadSize, walk);
++        return true;
++    };
++
++    if (!forEachBox(data, size, walk))
++        return false;
++    return haveHandler && supported && trackID;
++}
++
++bool SourceBufferPrivateHaiku::parseFragment(const uint8_t* moof, size_t moofSize, const uint8_t* mdat,
++    size_t mdatSize, size_t mdatOffsetFromMoof)
++{
++    // Offsets in a trun are relative to the start of the moof box (YouTube
++    // and every other fMP4 muxer set default-base-is-moof), which here is
++    // `moof` itself; the payload of the following mdat begins
++    // `mdatOffsetFromMoof` bytes in.
++    Reader moofReader(moof, moofSize);
++    uint32_t size32, type;
++    moofReader.u32(size32);
++    moofReader.u32(type);
++    size_t moofHeader = size32 == 1 ? 16 : 8;
++
++    Vector<Ref<MediaSample>> samples;
++
++    bool ok = forEachBox(moof + moofHeader, moofSize - moofHeader, [&](uint32_t boxType, const uint8_t* traf, size_t trafSize) {
++        if (boxType != fourcc("traf"))
++            return true;
++
++        uint32_t trackID = 0;
++        uint32_t tfhdFlags = 0;
++        uint64_t baseOffset = 0;
++        TrackDefaults defaults;
++        uint64_t baseDecodeTime = 0;
++        bool haveTfdt = false;
++        size_t nextDataOffset = 0;
++        bool haveNextDataOffset = false;
++
++        return forEachBox(traf, trafSize, [&](uint32_t childType, const uint8_t* child, size_t childSize) {
++            Reader reader(child, childSize);
++            if (childType == fourcc("tfhd")) {
++                reader.u32(tfhdFlags);
++                tfhdFlags &= 0xffffff;
++                if (!reader.u32(trackID))
++                    return false;
++                auto found = m_trackDefaults.find(trackID);
++                if (found != m_trackDefaults.end())
++                    defaults = found->value;
++                if (tfhdFlags & 0x1 && !reader.u64(baseOffset))
++                    return false;
++                if (tfhdFlags & 0x2)
++                    reader.skip(4);
++                if (tfhdFlags & 0x8 && !reader.u32(defaults.duration))
++                    return false;
++                if (tfhdFlags & 0x10 && !reader.u32(defaults.size))
++                    return false;
++                if (tfhdFlags & 0x20 && !reader.u32(defaults.flags))
++                    return false;
++                return true;
++            }
++            if (childType == fourcc("tfdt")) {
++                uint8_t version;
++                reader.u8(version);
++                reader.skip(3);
++                if (version == 1)
++                    haveTfdt = reader.u64(baseDecodeTime);
++                else {
++                    uint32_t time;
++                    haveTfdt = reader.u32(time);
++                    baseDecodeTime = time;
++                }
++                return haveTfdt;
++            }
++            if (childType != fourcc("trun"))
++                return true;
++
++            auto config = m_tracks.find(trackID);
++            if (config == m_tracks.end())
++                return true; // a track the init segment left out
++
++            uint8_t version;
++            uint32_t flags;
++            reader.u32(flags);
++            version = flags >> 24;
++            flags &= 0xffffff;
++            uint32_t count;
++            if (!reader.u32(count))
++                return false;
++            int32_t dataOffset = 0;
++            if (flags & 0x1) {
++                uint32_t value;
++                if (!reader.u32(value))
++                    return false;
++                dataOffset = int32_t(value);
++            }
++            uint32_t firstFlags = defaults.flags;
++            bool haveFirstFlags = flags & 0x4;
++            if (haveFirstFlags && !reader.u32(firstFlags))
++                return false;
++
++            // Where this run's data starts, as an offset into the moof.
++            size_t position;
++            if (flags & 0x1)
++                position = size_t(int64_t(baseOffset) + dataOffset);
++            else if (haveNextDataOffset)
++                position = nextDataOffset;
++            else
++                position = mdatOffsetFromMoof;
++
++            uint32_t timescale = config->value->timescale;
++            for (uint32_t i = 0; i < count; i++) {
++                uint32_t duration = defaults.duration, sampleSize = defaults.size;
++                uint32_t sampleFlags = (i == 0 && haveFirstFlags) ? firstFlags : defaults.flags;
++                int64_t compositionOffset = 0;
++                if (flags & 0x100 && !reader.u32(duration))
++                    return false;
++                if (flags & 0x200 && !reader.u32(sampleSize))
++                    return false;
++                if (flags & 0x400 && !reader.u32(sampleFlags))
++                    return false;
++                if (flags & 0x800) {
++                    uint32_t value;
++                    if (!reader.u32(value))
++                        return false;
++                    compositionOffset = version ? int64_t(int32_t(value)) : int64_t(value);
++                }
++
++                if (position < mdatOffsetFromMoof || position - mdatOffsetFromMoof + sampleSize > mdatSize) {
++                    MSE_LOG("sample outside its mdat, fragment dropped\n");
++                    return false;
++                }
++                const uint8_t* bytes = mdat + (position - mdatOffsetFromMoof);
++                position += sampleSize;
++
++                bool isSync = config->value->kind == HaikuTrackConfig::Kind::Audio
++                    || !(sampleFlags & 0x10000);
++                MediaTime decodeTime(int64_t(baseDecodeTime), timescale);
++                MediaTime presentationTime(int64_t(baseDecodeTime) + compositionOffset, timescale);
++                baseDecodeTime += duration;
++
++                Vector<uint8_t> sampleData;
++                sampleData.append(std::span<const uint8_t>(bytes, sampleSize));
++                samples.append(HaikuMediaSample::create(trackIDFor(trackID), config->value.copyRef(),
++                    WTFMove(sampleData),
++                    presentationTime, decodeTime, MediaTime(duration, timescale), isSync));
++            }
++            nextDataOffset = position;
++            haveNextDataOffset = true;
++            return true;
++        });
++    });
++    if (!ok)
++        return false;
++
++    if (!samples.isEmpty()) {
++        MSE_LOG("fragment: %zu samples, track %llu, %.3f..%.3f\n", samples.size(),
++            (unsigned long long)(samples.first()->trackID() & 0xffffffff),
++            samples.first()->presentationTime().toDouble(), samples.last()->presentationTime().toDouble());
++    } else
++        MSE_LOG("fragment without samples\n");
++    for (auto& sample : samples)
++        didReceiveSample(WTFMove(sample));
++    return true;
++}
++
++void SourceBufferPrivateHaiku::reenqueueMediaIfNeeded(const MediaTime& currentTime)
++{
++    uint64_t before = m_enqueued;
++    SourceBufferPrivate::reenqueueMediaIfNeeded(currentTime);
++    MSE_LOG("buffer %u: reenqueue at %.3f enqueued %llu\n", m_index, currentTime.toDouble(),
++        (unsigned long long)(m_enqueued - before));
++}
++
++void SourceBufferPrivateHaiku::flush(TrackID trackID)
++{
++    MSE_LOG("buffer %u: flush\n", m_index);
++    if (RefPtr mediaSource = mediaSourcePrivate())
++        mediaSource->flushTrack(trackID);
++}
++
++void SourceBufferPrivateHaiku::enqueueSample(Ref<MediaSample>&& sample, TrackID trackID)
++{
++    m_enqueued++;
++    if (RefPtr mediaSource = mediaSourcePrivate())
++        mediaSource->enqueueSample(static_reference_cast<HaikuMediaSample>(WTFMove(sample)), trackID);
++}
++
++bool SourceBufferPrivateHaiku::isReadyForMoreSamples(TrackID trackID)
++{
++    RefPtr mediaSource = mediaSourcePrivate();
++    return mediaSource && mediaSource->isReadyForMoreSamples(trackID);
++}
++
++void SourceBufferPrivateHaiku::notifyClientWhenReadyForMoreSamples(TrackID trackID)
++{
++    if (RefPtr mediaSource = mediaSourcePrivate())
++        mediaSource->notifyWhenReadyForMoreSamples(trackID, *this);
++}
++
++void SourceBufferPrivateHaiku::readyForMoreSamples(TrackID trackID)
++{
++    uint64_t before = m_enqueued;
++    provideMediaData(trackID);
++    MSE_LOG("buffer %u: more samples wanted, enqueued %llu\n", m_index, (unsigned long long)(m_enqueued - before));
++}
++
++} // namespace WebCore
++
++#endif
+diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/SourceBufferPrivateHaiku.h haikuwebkit/Source/WebCore/platform/graphics/haiku/SourceBufferPrivateHaiku.h
+--- orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/SourceBufferPrivateHaiku.h	1970-01-01 00:00:00.000000000 +0000
++++ haikuwebkit/Source/WebCore/platform/graphics/haiku/SourceBufferPrivateHaiku.h
+@@ -0,0 +1,90 @@
++/*
++ * Copyright (C) 2026 rainygirl
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Library General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ */
++
++#pragma once
++
++#if ENABLE(MEDIA_SOURCE)
++
++#include "HaikuMSESample.h"
++#include "SourceBufferPrivate.h"
++#include <wtf/HashMap.h>
++
++namespace WebCore {
++
++class MediaSourcePrivateHaiku;
++
++// A SourceBuffer for fragmented MP4, the format YouTube and most other MSE
++// sites send for H.264 and AAC. Appended bytes are parsed here into an
++// initialization segment and coded frames; WebCore's SourceBufferPrivate
++// does the buffering, the timestamp bookkeeping and the seek arithmetic, and
++// hands frames back through enqueueSample() for the player to decode.
++class SourceBufferPrivateHaiku final : public SourceBufferPrivate {
++public:
++    static Ref<SourceBufferPrivateHaiku> create(MediaSourcePrivateHaiku&, uint32_t index);
++    ~SourceBufferPrivateHaiku();
++
++    constexpr MediaPlatformType platformType() const final { return MediaPlatformType::Haiku; }
++
++    static bool supportsContainer(const String& lowercasedContainerType);
++
++    // Called by the player, on the main thread, when a track's queue has room.
++    void readyForMoreSamples(TrackID);
++    void reenqueueMediaIfNeeded(const MediaTime& currentTime) final;
++
++private:
++    SourceBufferPrivateHaiku(MediaSourcePrivateHaiku&, uint32_t index);
++
++    Ref<MediaPromise> appendInternal(Ref<SharedBuffer>&&) final;
++    void resetParserStateInternal() final;
++    bool canSwitchToType(const ContentType&) final;
++
++    void flush(TrackID) final;
++    void enqueueSample(Ref<MediaSample>&&, TrackID) final;
++    bool isReadyForMoreSamples(TrackID) final;
++    void notifyClientWhenReadyForMoreSamples(TrackID) final;
++
++#if !RELEASE_LOG_DISABLED
++    const Logger& sourceBufferLogger() const final;
++    uint64_t sourceBufferLogIdentifier() final { return 0; }
++    const Logger& logger() const final { return sourceBufferLogger(); }
++    ASCIILiteral logClassName() const final { return "SourceBufferPrivateHaiku"_s; }
++    uint64_t logIdentifier() const final { return 0; }
++    WTFLogChannel& logChannel() const final;
++#endif
++
++    // fMP4 parsing
++    bool parseBoxes();
++    bool parseMovie(const uint8_t*, size_t);
++    bool parseTrack(const uint8_t*, size_t, uint32_t& trackID, Ref<HaikuTrackConfig>&);
++    bool parseFragment(const uint8_t* moof, size_t moofSize, const uint8_t* mdat, size_t mdatSize, size_t mdatOffsetFromMoof);
++
++    TrackID trackIDFor(uint32_t mp4TrackID) const { return (TrackID(m_index) << 32) | mp4TrackID; }
++
++    RefPtr<MediaSourcePrivateHaiku> mediaSourcePrivate() const;
++
++    struct TrackDefaults {
++        uint32_t duration { 0 };
++        uint32_t size { 0 };
++        uint32_t flags { 0 };
++    };
++
++    uint32_t m_index;
++    uint64_t m_enqueued { 0 };
++    Vector<uint8_t> m_input;
++    HashMap<uint32_t, Ref<HaikuTrackConfig>, IntHash<uint32_t>, WTF::UnsignedWithZeroKeyHashTraits<uint32_t>> m_tracks;
++    HashMap<uint32_t, TrackDefaults, IntHash<uint32_t>, WTF::UnsignedWithZeroKeyHashTraits<uint32_t>> m_trackDefaults;
++};
++
++} // namespace WebCore
++
++SPECIALIZE_TYPE_TRAITS_BEGIN(WebCore::SourceBufferPrivateHaiku)
++static bool isType(const WebCore::SourceBufferPrivate& sourceBuffer) { return sourceBuffer.platformType() == WebCore::MediaPlatformType::Haiku; }
++SPECIALIZE_TYPE_TRAITS_END()
++
++#endif
+diff -ruN orig/haikuwebkit/Source/WebKitLegacy/haiku/WebCoreSupport/ChromeClientHaiku.cpp haikuwebkit/Source/WebKitLegacy/haiku/WebCoreSupport/ChromeClientHaiku.cpp
+--- orig/haikuwebkit/Source/WebKitLegacy/haiku/WebCoreSupport/ChromeClientHaiku.cpp
++++ haikuwebkit/Source/WebKitLegacy/haiku/WebCoreSupport/ChromeClientHaiku.cpp
+@@ -235,6 +235,13 @@
+ void ChromeClientHaiku::addMessageToConsole(MessageSource, MessageLevel, const String& message,
+                                             unsigned int lineNumber, unsigned columnNumber, const String& sourceID)
+ {
++    // WEBKIT_MEDIA_DEBUG also copies the page's console to stderr, which is
++    // where a site's own reason for refusing to play shows up.
++    static const bool debug = getenv("WEBKIT_MEDIA_DEBUG") != nullptr;
++    if (debug) {
++        fprintf(stderr, "[console] %s:%u %s\n", sourceID.utf8().data(), lineNumber,
++            message.left(400).utf8().data());
++    }
+     m_webPage->addMessageToConsole(BString(sourceID), lineNumber, columnNumber,
+         BString(message));
+ }
+diff -ruN orig/haikuwebkit/Source/cmake/OptionsHaiku.cmake haikuwebkit/Source/cmake/OptionsHaiku.cmake
+--- orig/haikuwebkit/Source/cmake/OptionsHaiku.cmake
++++ haikuwebkit/Source/cmake/OptionsHaiku.cmake
+@@ -67,7 +67,7 @@
+ WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_GAMEPAD PUBLIC OFF)
+ WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_GEOLOCATION PUBLIC OFF)
+ WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_MEDIA_CAPTURE PUBLIC ON)
+-WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_MEDIA_SOURCE PUBLIC OFF)
++WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_MEDIA_SOURCE PUBLIC ON)
+ WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_MEDIA_STREAM PUBLIC OFF)
+ WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_MEMORY_SAMPLER PUBLIC ON)
+ WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_MHTML PRIVATE ON)
