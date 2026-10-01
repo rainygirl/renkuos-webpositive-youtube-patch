@@ -25,7 +25,14 @@ GMA500)에서 개발하고 측정했습니다.
 - 미디어 열기를 **메인 스레드 밖으로** 옮겼습니다(전에는 열리는 동안 페이지가
   수 초씩 멈췄음).
 - `canPlayType()`이 **코덱별로** 답합니다(존재하지 않는 코덱에도 "예"라고 했음).
-- 재생 중 WebPositive를 **종료할 때의 크래시**를 고쳤습니다.
+- 재생 중이나 재생 후 WebPositive를 **종료할 때의 크래시**를 고쳤습니다.
+- CSS 필터 결과를 **레이어가 바뀌지 않는 동안 재사용**합니다. 전에는 근처가
+  다시 그려질 때마다 블러를 새로 계산했습니다. YouTube 플레이어 뒤의 흐린 배경이
+  메인 스레드의 12.7%를 쓰던 것이 0.5%로 줄었습니다.
+- 32비트 x86 JavaScriptCore용 **어셈블리 인터프리터**
+  (`haikuwebkit-1.9.19-x86-llint.patch`). 업스트림에는 이식형 C 루프만 있어서
+  offlineasm의 x86-32 백엔드를 새로 만들었습니다. 인터프리터로 도는 JavaScript가
+  4분의 1~3분의 1 빨라집니다.
 
 ## 현재 상태
 
@@ -35,19 +42,19 @@ VAIO P에서 원래 user agent로 측정한 결과입니다.
   MSE로 **재생됩니다**. 640x360 H.264를 GMA500으로 디코딩하고 AAC 음성도
   나오며, 데이터가 있는 동안은 30fps에 **드롭 0**입니다.
 - **아직 끊김 없이 이어지지는 않습니다.** YouTube 플레이어가 다음 조각을
-  8~30초 간격으로만 요청해서, 몇 초 재생하고 기다리기를 반복합니다. 요청
-  자체는 0.3~2초면 끝나고, 느린 것은 요청 시점을 정하는 YouTube JavaScript입니다.
-  32비트 x86의 JavaScriptCore에는 JIT도 어셈블리 인터프리터도 없어(업스트림이
-  둘 다 제거) 이식형 C 인터프리터로 돌고, YouTube 플레이어는 매우 큰
-  스크립트입니다. 자세한 내용은 [`AGENTS.md`](AGENTS.md)에 있습니다.
+  8~30초 간격으로만 요청해서 몇 초 재생하고 기다리기를 반복하고, 첫 화면까지
+  약 3분이 걸립니다. 요청 자체는 0.3~2초면 끝나고, 느린 것은 요청 시점을 정하는
+  YouTube JavaScript입니다. 어셈블리 인터프리터가 도움은 되지만(첫 화면 170초,
+  C 루프는 190~240초) 인터프리터는 JIT가 아니고, 업스트림에는 32비트 x86용 JIT가
+  없습니다. 자세한 내용은 [`AGENTS.md`](AGENTS.md)에 있습니다.
 - 일반 YouTube 영상은 이전처럼 재생됩니다.
 
 ## 빌드
 
-`webkit/build-haikuwebkit-x86.sh`가 Linux에서 `haikuwebkit_x86` 1.9.19-21을
+`webkit/build-haikuwebkit-x86.sh`가 Linux에서 `haikuwebkit_x86` 1.9.19-22를
 크로스 빌드합니다.
 [haiku-rwebpositive-arm64](https://github.com/rainygirl/haiku-rwebpositive-arm64)의
-x86 빌드(메모리 누수 수정)에 이 저장소의 패치를 얹어 실행하므로, `RWP`에 그
+x86 빌드(메모리 누수 수정)에 이 저장소의 패치 두 개를 얹어 실행하므로, `RWP`에 그
 체크아웃 경로를 지정하세요.
 
 ```sh
@@ -59,11 +66,13 @@ RWP=/path/to/haiku-rwebpositive-arm64 webkit/build-haikuwebkit-x86.sh
 
 ```sh
 patch -p0 < webkit/haikuwebkit-1.9.19-youtube.patch
+patch -p0 < webkit/haikuwebkit-1.9.19-x86-llint.patch
 ```
 
-이미 있는 빌드 디렉터리를 쓴다면 `ENABLE_MEDIA_SOURCE`도 켜 주세요
-(`-DENABLE_MEDIA_SOURCE=ON`). CMake가 예전 캐시의 `OFF`를 유지하면 MSE 코드가
-통째로 빠진 채 빌드됩니다.
+이미 있는 빌드 디렉터리를 쓴다면 `-DENABLE_MEDIA_SOURCE=ON`과
+`-DENABLE_C_LOOP=OFF`도 주세요. CMake가 예전 캐시 값을 유지하면 MSE 코드가
+통째로 빠지고 C 루프가 그대로 남습니다. LLInt 빌드에는 Ruby(offlineasm)가
+필요합니다(모든 WebKit 빌드와 같음).
 
 ## 디버깅
 

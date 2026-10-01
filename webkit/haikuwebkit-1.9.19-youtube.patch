@@ -91,8 +91,23 @@ diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/MediaPlayerEnums.h h
  };
  
  enum class MediaPlayerWirelessPlaybackTargetType : uint8_t {
+diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/filters/FilterResults.h haikuwebkit/Source/WebCore/platform/graphics/filters/FilterResults.h
+--- orig/haikuwebkit/Source/WebCore/platform/graphics/filters/FilterResults.h
++++ haikuwebkit/Source/WebCore/platform/graphics/filters/FilterResults.h
+@@ -47,6 +47,11 @@
+     FilterImage* effectResult(FilterEffect&) const;
+     void setEffectResult(FilterEffect&, const FilterImageVector& inputs, Ref<FilterImage>&& result);
+     void clearEffectResult(FilterEffect&);
++    void clear()
++    {
++        m_results.clear();
++        m_resultReferences.clear();
++    }
+ 
+ private:
+     size_t memoryCost() const;
 diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/HLSMediaIOHaiku.cpp haikuwebkit/Source/WebCore/platform/graphics/haiku/HLSMediaIOHaiku.cpp
---- orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/HLSMediaIOHaiku.cpp	1970-01-01 00:00:00.000000000 +0000
+--- orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/HLSMediaIOHaiku.cpp
 +++ haikuwebkit/Source/WebCore/platform/graphics/haiku/HLSMediaIOHaiku.cpp
 @@ -0,0 +1,407 @@
 +/*
@@ -503,7 +518,7 @@ diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/HLSMediaIOHaik
 +
 +#endif
 diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/HLSMediaIOHaiku.h haikuwebkit/Source/WebCore/platform/graphics/haiku/HLSMediaIOHaiku.h
---- orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/HLSMediaIOHaiku.h	1970-01-01 00:00:00.000000000 +0000
+--- orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/HLSMediaIOHaiku.h
 +++ haikuwebkit/Source/WebCore/platform/graphics/haiku/HLSMediaIOHaiku.h
 @@ -0,0 +1,67 @@
 +/*
@@ -574,7 +589,7 @@ diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/HLSMediaIOHaik
 +
 +#endif
 diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/HaikuMSESample.h haikuwebkit/Source/WebCore/platform/graphics/haiku/HaikuMSESample.h
---- orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/HaikuMSESample.h	1970-01-01 00:00:00.000000000 +0000
+--- orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/HaikuMSESample.h
 +++ haikuwebkit/Source/WebCore/platform/graphics/haiku/HaikuMSESample.h
 @@ -0,0 +1,136 @@
 +/*
@@ -735,12 +750,13 @@ diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPri
  #include <Bitmap.h>
  #include <DataIO.h>
  #include <HttpRequest.h>
-@@ -37,8 +40,65 @@
+@@ -37,8 +40,120 @@
  #include <SoundPlayer.h>
  #include <View.h>
  
 +#include <stdio.h>
 +#include <stdlib.h>
++#include <map>
 +#include <set>
 +
  namespace WebCore {
@@ -769,22 +785,74 @@ diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPri
 +    return *players;
 +}
 +
-+static void stopSoundPlayersAtExit()
++static std::map<void*, void (*)(void*)>& mediaExitHandlers()
 +{
-+    BAutolock locker(soundPlayersLock());
-+    for (BSoundPlayer* player : soundPlayers())
-+        player->Stop(true, false);
++    static std::map<void*, void (*)(void*)>* handlers = new std::map<void*, void (*)(void*)>;
++    return *handlers;
 +}
 +
-+void registerHTML5SoundPlayer(BSoundPlayer* player)
++void shutdownHTML5Media()
++{
++    // The handlers join threads that may themselves take the lock, so they
++    // run without it.
++    std::map<void*, void (*)(void*)> handlers;
++    {
++        BAutolock locker(soundPlayersLock());
++        handlers = mediaExitHandlers();
++        mediaExitHandlers().clear();
++    }
++    if (mediaDebug())
++        fprintf(stderr, "[media] shutdown: stopping %zu media threads\n", handlers.size());
++    for (auto& [owner, handler] : handlers)
++        handler(owner);
++
++    BAutolock locker(soundPlayersLock());
++    if (mediaDebug())
++        fprintf(stderr, "[media] shutdown: deleting %zu sound players\n", soundPlayers().size());
++    // Deleted, not only stopped: a stopped BSoundPlayer still has a node with
++    // a control thread, and that thread faults once the Media Kit's own
++    // teardown has run after us. Media Source players are not destroyed
++    // before exit at all, so theirs always did.
++    for (BSoundPlayer* player : soundPlayers()) {
++        player->Stop(true, false);
++        delete player;
++    }
++    soundPlayers().clear();
++}
++
++static void stopSoundPlayersAtExit()
++{
++    shutdownHTML5Media();
++}
++
++// Called with soundPlayersLock() held.
++static void installSoundPlayersExitHandler()
 +{
 +    static bool registered = false;
-+    BAutolock locker(soundPlayersLock());
 +    if (!registered) {
 +        atexit(stopSoundPlayersAtExit);
 +        registered = true;
 +    }
++}
++
++void registerHTML5SoundPlayer(BSoundPlayer* player)
++{
++    BAutolock locker(soundPlayersLock());
++    installSoundPlayersExitHandler();
 +    soundPlayers().insert(player);
++}
++
++void registerHTML5MediaExitHandler(void* owner, void (*handler)(void*))
++{
++    BAutolock locker(soundPlayersLock());
++    installSoundPlayersExitHandler();
++    mediaExitHandlers()[owner] = handler;
++}
++
++void unregisterHTML5MediaExitHandler(void* owner)
++{
++    BAutolock locker(soundPlayersLock());
++    mediaExitHandlers().erase(owner);
 +}
 +
 +void deleteHTML5SoundPlayer(BSoundPlayer* player)
@@ -793,7 +861,9 @@ diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPri
 +        return;
 +    {
 +        BAutolock locker(soundPlayersLock());
-+        soundPlayers().erase(player);
++        // Already deleted by shutdownHTML5Media().
++        if (!soundPlayers().erase(player))
++            return;
 +    }
 +    delete player;
 +}
@@ -801,7 +871,7 @@ diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPri
  class MediaPlayerFactoryHaiku final : public MediaPlayerFactory {
  private:
      MediaPlayerEnums::MediaEngineIdentifier identifier() const final { return MediaPlayerEnums::MediaEngineIdentifier::Haiku; };
-@@ -88,7 +148,7 @@
+@@ -88,7 +203,7 @@
  
  MediaPlayerPrivate::~MediaPlayerPrivate()
  {
@@ -810,7 +880,7 @@ diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPri
  
      m_mediaLock.Lock();
  
-@@ -98,9 +158,11 @@
+@@ -98,9 +213,11 @@
  }
  
  #if ENABLE(MEDIA_SOURCE)
@@ -824,7 +894,7 @@ diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPri
  }
  #endif
  
-@@ -109,28 +171,81 @@
+@@ -109,28 +226,81 @@
      // Cleanup from previous request (can this even happen?)
      if (m_soundPlayer)
          m_soundPlayer->Stop(false);
@@ -912,7 +982,7 @@ diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPri
      } else {
          m_readyState = MediaPlayer::ReadyState::HaveMetadata;
          m_networkState = MediaPlayer::NetworkState::FormatError;
-@@ -144,6 +259,10 @@
+@@ -144,6 +314,10 @@
      m_mediaLock.Lock();
      delete m_mediaFile;
      m_mediaFile = nullptr;
@@ -923,7 +993,7 @@ diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPri
      m_audioTrack = nullptr;
      m_videoTrack = nullptr;
      m_mediaLock.Unlock();
-@@ -165,11 +284,15 @@
+@@ -165,11 +339,15 @@
      // Deleting the BMediaFile release the tracks
      if (player->m_audioTrack) {
          // TODO handle the case where there is a video, but no audio track.
@@ -944,7 +1014,7 @@ diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPri
              // Notify that we're done playing...
              player->m_currentTime = player->m_audioTrack->Duration() / 1000000.f;
              player->m_soundPlayer->Stop(false);
-@@ -186,15 +309,18 @@
+@@ -186,15 +364,18 @@
      }
  
      if (player->m_videoTrack && player->m_audioTrack) {
@@ -966,7 +1036,7 @@ diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPri
  
              WeakPtr<MediaPlayerPrivate> p = WeakPtr(player);
              callOnMainThread([p] {
-@@ -248,6 +374,8 @@
+@@ -248,6 +429,8 @@
  WTF::MediaTime MediaPlayerPrivate::duration() const
  {
      // TODO handle the case where there is a video, but no audio track.
@@ -975,7 +1045,7 @@ diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPri
      if (!m_audioTrack)
          return WTF::MediaTime();
      return WTF::MediaTime::createWithDouble(m_audioTrack->Duration() / 1000000.f);
-@@ -273,10 +401,16 @@
+@@ -273,10 +456,16 @@
      // Usually, seeking the video is rounded to the nearest keyframe. This
      // modifies newTime, and we pass the adjusted value to the audio track, to
      // keep them in sync
@@ -992,7 +1062,7 @@ diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPri
  }
  
  bool MediaPlayerPrivate::seeking() const
-@@ -335,14 +469,9 @@
+@@ -335,14 +524,9 @@
  
  // #pragma mark - private methods
  
@@ -1009,7 +1079,7 @@ diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPri
          for (int i = m_mediaFile->CountTracks() - 1; i >= 0; i--)
          {
              BMediaTrack* track = m_mediaFile->TrackAt(i);
-@@ -354,6 +483,7 @@
+@@ -354,6 +538,7 @@
                  if (m_videoTrack)
                      continue;
                  m_videoTrack = track;
@@ -1017,7 +1087,7 @@ diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPri
  
                  m_frameBuffer = new BBitmap(
                      BRect(0, 0, format.Width() - 1, format.Height() - 1),
-@@ -367,9 +497,11 @@
+@@ -367,9 +552,11 @@
                  if (m_audioTrack)
                      continue;
                  m_audioTrack = track;
@@ -1029,7 +1099,7 @@ diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPri
                  m_soundPlayer->SetVolume(m_volume);
                  if (!m_paused)
                      m_soundPlayer->Start();
-@@ -399,6 +531,12 @@
+@@ -399,6 +586,12 @@
          cache.get().add(String::fromUTF8(mfi.mime_type));
      }
  
@@ -1042,7 +1112,7 @@ diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPri
      typeListInitialized = true;
      return cache;
  }
-@@ -408,14 +546,46 @@
+@@ -408,14 +601,46 @@
      types = mimeTypeCache();
  }
  
@@ -1094,7 +1164,7 @@ diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPri
 diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaiku.h haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaiku.h
 --- orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaiku.h
 +++ haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaiku.h
-@@ -39,6 +39,11 @@
+@@ -39,6 +39,19 @@
  namespace WebCore {
  
  class MediaPlayerFactoryHaiku;
@@ -1103,10 +1173,18 @@ diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPri
 +// Sound players are stopped at process exit; see MediaPlayerPrivateHaiku.cpp.
 +void registerHTML5SoundPlayer(BSoundPlayer*);
 +void deleteHTML5SoundPlayer(BSoundPlayer*);
++// Called at exit, before the sound players are deleted, for anything that
++// still runs threads touching them (a Media Source player's decoder).
++void registerHTML5MediaExitHandler(void* owner, void (*handler)(void* owner));
++void unregisterHTML5MediaExitHandler(void* owner);
++// Stops all media playback for good. BWebPage::ShutdownOnce() calls it; at
++// exit it would be too late, as the Media Kit add-ons a player uses have
++// been torn down by then.
++WEBCORE_EXPORT void shutdownHTML5Media();
  
  class MediaPlayerPrivate
      : public MediaPlayerPrivateInterface
-@@ -62,7 +67,7 @@
+@@ -62,7 +75,7 @@
  
          void load(const String& url) override;
  #if ENABLE(MEDIA_SOURCE)
@@ -1115,7 +1193,7 @@ diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPri
  #endif
          void cancelLoad() override;
  
-@@ -99,7 +104,10 @@
+@@ -99,7 +112,10 @@
  
      constexpr MediaPlayerType mediaPlayerType() const final { return MediaPlayerType::Haiku; }
  private:
@@ -1127,7 +1205,7 @@ diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPri
  
          static void playCallback(void*, void*, size_t,
              const media_raw_audio_format&);
-@@ -123,6 +131,25 @@
+@@ -123,6 +139,25 @@
          float m_volume;
          float m_currentTime;
          bool m_paused;
@@ -1154,9 +1232,9 @@ diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPri
  
  }
 diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaikuMSE.cpp haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaikuMSE.cpp
---- orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaikuMSE.cpp	1970-01-01 00:00:00.000000000 +0000
+--- orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaikuMSE.cpp
 +++ haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaikuMSE.cpp
-@@ -0,0 +1,933 @@
+@@ -0,0 +1,946 @@
 +/*
 + * Copyright (C) 2026 rainygirl
 + *
@@ -1394,10 +1472,21 @@ diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPri
 +MediaPlayerPrivateHaikuMSE::MediaPlayerPrivateHaikuMSE(MediaPlayer* player)
 +    : m_player(player)
 +{
++    // A page is not torn down before the application exits, so the decoding
++    // thread would still be running, and using the sound player and the
++    // Media Kit, while they are destroyed.
++    registerHTML5MediaExitHandler(this, [](void* owner) {
++        auto* player = static_cast<MediaPlayerPrivateHaikuMSE*>(owner);
++        player->m_shutDown = true;
++        player->stopDecodeThread();
++        deleteHTML5SoundPlayer(player->m_soundPlayer);
++        player->m_soundPlayer = nullptr;
++    });
 +}
 +
 +MediaPlayerPrivateHaikuMSE::~MediaPlayerPrivateHaikuMSE()
 +{
++    unregisterHTML5MediaExitHandler(this);
 +    stopDecodeThread();
 +    deleteHTML5SoundPlayer(m_soundPlayer);
 +    m_soundPlayer = nullptr;
@@ -1760,6 +1849,8 @@ diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPri
 +
 +void MediaPlayerPrivateHaikuMSE::startDecodeThread()
 +{
++    if (m_shutDown)
++        return;
 +    if (m_thread >= 0)
 +        return;
 +    m_weakThis = WeakPtr { *this };
@@ -2091,9 +2182,9 @@ diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPri
 +
 +#endif
 diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaikuMSE.h haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaikuMSE.h
---- orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaikuMSE.h	1970-01-01 00:00:00.000000000 +0000
+--- orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaikuMSE.h
 +++ haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPrivateHaikuMSE.h
-@@ -0,0 +1,193 @@
+@@ -0,0 +1,194 @@
 +/*
 + * Copyright (C) 2026 rainygirl
 + *
@@ -2273,6 +2364,7 @@ diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPri
 +    WeakPtr<MediaPlayerPrivateHaikuMSE> m_weakThis; // made on the main thread, copied by others
 +    thread_id m_thread { -1 };
 +    volatile bool m_quit { false };
++    bool m_shutDown { false };
 +
 +    // Owned by the decoding thread.
 +    HaikuSampleDecoder* m_videoDecoder { nullptr };
@@ -2288,7 +2380,7 @@ diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaPlayerPri
 +
 +#endif
 diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaSourcePrivateHaiku.cpp haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaSourcePrivateHaiku.cpp
---- orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaSourcePrivateHaiku.cpp	1970-01-01 00:00:00.000000000 +0000
+--- orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaSourcePrivateHaiku.cpp
 +++ haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaSourcePrivateHaiku.cpp
 @@ -0,0 +1,146 @@
 +/*
@@ -2438,7 +2530,7 @@ diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaSourcePri
 +
 +#endif
 diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaSourcePrivateHaiku.h haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaSourcePrivateHaiku.h
---- orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaSourcePrivateHaiku.h	1970-01-01 00:00:00.000000000 +0000
+--- orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaSourcePrivateHaiku.h
 +++ haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaSourcePrivateHaiku.h
 @@ -0,0 +1,62 @@
 +/*
@@ -2504,7 +2596,7 @@ diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/MediaSourcePri
 +
 +#endif
 diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/SourceBufferPrivateHaiku.cpp haikuwebkit/Source/WebCore/platform/graphics/haiku/SourceBufferPrivateHaiku.cpp
---- orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/SourceBufferPrivateHaiku.cpp	1970-01-01 00:00:00.000000000 +0000
+--- orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/SourceBufferPrivateHaiku.cpp
 +++ haikuwebkit/Source/WebCore/platform/graphics/haiku/SourceBufferPrivateHaiku.cpp
 @@ -0,0 +1,706 @@
 +/*
@@ -3214,7 +3306,7 @@ diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/SourceBufferPr
 +
 +#endif
 diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/SourceBufferPrivateHaiku.h haikuwebkit/Source/WebCore/platform/graphics/haiku/SourceBufferPrivateHaiku.h
---- orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/SourceBufferPrivateHaiku.h	1970-01-01 00:00:00.000000000 +0000
+--- orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/SourceBufferPrivateHaiku.h
 +++ haikuwebkit/Source/WebCore/platform/graphics/haiku/SourceBufferPrivateHaiku.h
 @@ -0,0 +1,90 @@
 +/*
@@ -3307,6 +3399,219 @@ diff -ruN orig/haikuwebkit/Source/WebCore/platform/graphics/haiku/SourceBufferPr
 +SPECIALIZE_TYPE_TRAITS_END()
 +
 +#endif
+diff -ruN orig/haikuwebkit/Source/WebCore/rendering/RenderLayer.cpp haikuwebkit/Source/WebCore/rendering/RenderLayer.cpp
+--- orig/haikuwebkit/Source/WebCore/rendering/RenderLayer.cpp
++++ haikuwebkit/Source/WebCore/rendering/RenderLayer.cpp
+@@ -3513,7 +3513,8 @@
+     // If the filter needs the full source image, we need to avoid using the clip rectangles.
+     // Otherwise, if for example this layer has overflow:hidden, a drop shadow will not compute correctly.
+     // Note that we will still apply the clipping on the final rendering of the filter.
+-    paintingInfo.clipToDirtyRect = !paintingFilters->hasFilterThatMovesPixels();
++    // A reused filter result needs no source image at all.
++    paintingInfo.clipToDirtyRect = !paintingFilters->hasFilterThatMovesPixels() || paintingFilters->reusesFilterResult();
+ 
+     paintingInfo.requireSecurityOriginAccessForWidgets = paintingFilters->hasFilterThatShouldBeRestrictedBySecurityOrigin();
+ 
+@@ -3705,6 +3706,8 @@
+             beginTransparencyLayers(context, localPaintingInfo, paintingInfo.paintDirtyRect);
+         }
+         GraphicsContext& currentContext = filterContext ? *filterContext : context;
++        // The filter draws its previous output; the layer's contents are not needed.
++        bool reusesFilterResult = filterContext && m_filters->reusesFilterResult() && !isCollectingEventRegion && !isCollectingAccessibilityRegion;
+ 
+         if (filterContext)
+             localPaintingInfo.paintBehavior.add(PaintBehavior::DontShowVisitedLinks);
+@@ -3720,7 +3723,7 @@
+             performOverlapTests(*localPaintingInfo.overlapTestRequests, localPaintingInfo.rootLayer, this);
+ 
+         LayoutRect paintDirtyRect = localPaintingInfo.paintDirtyRect;
+-        if (shouldPaintContent || shouldPaintOutline || isPaintingOverlayScrollbars || isCollectingEventRegion || isCollectingAccessibilityRegion) {
++        if (!reusesFilterResult && (shouldPaintContent || shouldPaintOutline || isPaintingOverlayScrollbars || isCollectingEventRegion || isCollectingAccessibilityRegion)) {
+             // Collect the fragments. This will compute the clip rectangles and paint offsets for each layer fragment, as well as whether or not the content of each
+             // fragment should paint. If the parent's filter dictates full repaint to ensure proper filter effect,
+             // use the overflow clip as dirty rect, instead of no clipping. It maintains proper clipping for overflow::scroll.
+@@ -3745,7 +3748,7 @@
+         }
+ 
+         // Now walk the sorted list of children with negative z-indices.
+-        if (shouldPaintNegativeZIndexChildren)
++        if (shouldPaintNegativeZIndexChildren && !reusesFilterResult)
+             paintList(negativeZOrderLayers(), currentContext, paintingInfo, localPaintFlags);
+         
+         if (isPaintingCompositedForeground) {
+@@ -3764,7 +3767,7 @@
+         if (shouldPaintOutline)
+             paintOutlineForFragments(layerFragments, currentContext, localPaintingInfo, paintBehavior, subtreePaintRootForRenderer);
+ 
+-        if (isPaintingCompositedForeground) {
++        if (isPaintingCompositedForeground && !reusesFilterResult) {
+             // Paint any child layers that have overflow.
+             paintList(normalFlowLayers(), currentContext, paintingInfo, localPaintFlags);
+         
+diff -ruN orig/haikuwebkit/Source/WebCore/rendering/RenderLayerFilters.cpp haikuwebkit/Source/WebCore/rendering/RenderLayerFilters.cpp
+--- orig/haikuwebkit/Source/WebCore/rendering/RenderLayerFilters.cpp
++++ haikuwebkit/Source/WebCore/rendering/RenderLayerFilters.cpp
+@@ -31,6 +31,8 @@
+ #include "config.h"
+ #include "RenderLayerFilters.h"
+ 
++#include "FilterResults.h"
++
+ #include "CSSFilter.h"
+ #include "CachedSVGDocument.h"
+ #include "CachedSVGDocumentReference.h"
+@@ -66,6 +68,14 @@
+     return m_filter && m_filter->hasFilterThatShouldBeRestrictedBySecurityOrigin();
+ }
+ 
++void RenderLayerFilters::clearFilter()
++{
++    m_filter = nullptr;
++    if (m_filterResults)
++        m_filterResults->clear();
++    m_filterResultsAreValid = false;
++}
++
+ bool RenderLayerFilters::hasSourceImage() const
+ {
+     return m_targetSwitcher && m_targetSwitcher->hasSourceImage();
+@@ -159,10 +169,23 @@
+     if (targetBoundingBox.isEmpty())
+         return nullptr;
+ 
++    // Filter the whole layer, not just the part this paint dirtied, when the
++    // filter moves pixels and the layer is not huge. The box is then the same
++    // from one paint to the next, so the filter is not rebuilt and its output
++    // can be reused (see m_reusesFilterResult) while the layer is unchanged.
++    // Taken from the dirty rect, it changed with every repaint around the
++    // layer -- a video frame, then a progress bar -- and nothing was reused.
++    static constexpr uint64_t maximumWholeLayerFilterArea = 1024 * 1024;
++    if (!outsets.isZero() && !is<RenderSVGShape>(renderer)
++        && uint64_t(filterBoxRect.width().toUnsigned()) * filterBoxRect.height().toUnsigned() <= maximumWholeLayerFilterArea)
++        targetBoundingBox = filterBoxRect;
++
++    bool filterIsNew = false;
+     if (!m_filter || m_targetBoundingBox != targetBoundingBox) {
+         m_targetBoundingBox = targetBoundingBox;
+         // FIXME: This rebuilds the entire effects chain even if the filter style didn't change.
+         m_filter = CSSFilter::create(renderer, renderer.style().filter(), m_preferredFilterRenderingModes, m_filterScale, m_targetBoundingBox, context);
++        filterIsNew = true;
+     }
+ 
+     if (!m_filter)
+@@ -189,7 +212,18 @@
+ 
+     filter.setFilterRegion(m_filterRegion);
+ 
+-    if (!filter.hasFilterThatMovesPixels())
++    // A filter that moves pixels gets a dirty source rect from every repaint
++    // inside the layer (RenderObject::repaintUsingContainer), so an empty one
++    // means the layer looks as it did at the last render, and so does the
++    // filter output. Painting it again because something next to it or on top
++    // of it changed -- a playing video, a caret -- is all cost: a blur over a
++    // large layer was most of a page's paint time on a slow machine.
++    m_reusesFilterResult = filter.hasFilterThatMovesPixels() && !filterIsNew && !hasUpdatedBackingStore
++        && m_filterResultsAreValid && m_dirtySourceRect.isEmpty() && hasSourceImage();
++
++    if (m_reusesFilterResult)
++        m_repaintRect = { };
++    else if (!filter.hasFilterThatMovesPixels())
+         m_repaintRect = dirtyRect;
+     else if (hasUpdatedBackingStore || !hasSourceImage())
+         m_repaintRect = filterRegion;
+@@ -201,13 +235,22 @@
+ 
+     resetDirtySourceRect();
+ 
++    // The context switcher keeps a pointer to these results, so they are
++    // cleared rather than replaced.
++    if (!m_filterResults)
++        m_filterResults = makeUnique<FilterResults>();
++    if (!m_reusesFilterResult) {
++        m_filterResults->clear();
++        m_filterResultsAreValid = false;
++    }
++
+     if (!m_targetSwitcher || hasUpdatedBackingStore) {
+         FloatRect sourceImageRect;
+         if (is<RenderSVGShape>(renderer))
+             sourceImageRect = renderer.strokeBoundingBox();
+         else
+             sourceImageRect = m_targetBoundingBox;
+-        m_targetSwitcher = GraphicsContextSwitcher::create(context, sourceImageRect, DestinationColorSpace::SRGB(), { &filter });
++        m_targetSwitcher = GraphicsContextSwitcher::create(context, sourceImageRect, DestinationColorSpace::SRGB(), { &filter }, m_filterResults.get());
+     }
+ 
+     if (!m_targetSwitcher)
+@@ -224,6 +267,7 @@
+ 
+     ASSERT(m_targetSwitcher);
+     m_targetSwitcher->endClipAndDrawSourceImage(destinationContext, DestinationColorSpace::SRGB());
++    m_filterResultsAreValid = true;
+ 
+     LOG_WITH_STREAM(Filters, stream << "RenderLayerFilters " << this << " applyFilterEffect done\n");
+ }
+diff -ruN orig/haikuwebkit/Source/WebCore/rendering/RenderLayerFilters.h haikuwebkit/Source/WebCore/rendering/RenderLayerFilters.h
+--- orig/haikuwebkit/Source/WebCore/rendering/RenderLayerFilters.h
++++ haikuwebkit/Source/WebCore/rendering/RenderLayerFilters.h
+@@ -41,6 +41,7 @@
+ class CachedSVGDocument;
+ class Element;
+ class FilterOperations;
++class FilterResults;
+ class GraphicsContextSwitcher;
+ 
+ class RenderLayerFilters final : private CachedSVGDocumentClient {
+@@ -53,7 +54,7 @@
+     void expandDirtySourceRect(const LayoutRect& rect) { m_dirtySourceRect.unite(rect); }
+ 
+     CSSFilter* filter() const { return m_filter.get(); }
+-    void clearFilter() { m_filter = nullptr; }
++    void clearFilter();
+     
+     bool hasFilterThatMovesPixels() const;
+     bool hasFilterThatShouldBeRestrictedBySecurityOrigin() const;
+@@ -70,6 +71,10 @@
+ 
+     // Per render
+     LayoutRect repaintRect() const { return m_repaintRect; }
++    // True when this render draws the previous filter output again instead of
++    // repainting the layer and filtering it: nothing in the layer has been
++    // invalidated since. The layer's contents need not be painted.
++    bool reusesFilterResult() const { return m_reusesFilterResult; }
+ 
+     GraphicsContext* beginFilterEffect(RenderElement&, GraphicsContext&, const LayoutRect& filterBoxRect, const LayoutRect& dirtyRect, const LayoutRect& layerRepaintRect, const LayoutRect& clipRect);
+     void applyFilterEffect(GraphicsContext& destinationContext);
+@@ -91,6 +96,10 @@
+     FloatRect m_filterRegion;
+ 
+     RefPtr<CSSFilter> m_filter;
++    // Filter outputs kept between renders; see reusesFilterResult().
++    std::unique_ptr<FilterResults> m_filterResults;
++    bool m_filterResultsAreValid { false };
++    bool m_reusesFilterResult { false };
+     std::unique_ptr<GraphicsContextSwitcher> m_targetSwitcher;
+ };
+ 
+diff -ruN orig/haikuwebkit/Source/WebKitLegacy/haiku/API/WebPage.cpp haikuwebkit/Source/WebKitLegacy/haiku/API/WebPage.cpp
+--- orig/haikuwebkit/Source/WebKitLegacy/haiku/API/WebPage.cpp
++++ haikuwebkit/Source/WebKitLegacy/haiku/API/WebPage.cpp
+@@ -210,8 +210,15 @@
+     RunLoop::run(); // This attaches it to the existing be_app looper
+ }
+ 
++namespace WebCore {
++void shutdownHTML5Media();
++}
++
+ /*static*/ void BWebPage::ShutdownOnce()
+ {
++	// Media threads use Media Kit add-ons that are unloaded at exit.
++	WebCore::shutdownHTML5Media();
++
+ 	WebKit::iconDatabase().close();
+ 
+ 	// There is a crash on exit if the font cache is not empty, so make sure it is
 diff -ruN orig/haikuwebkit/Source/WebKitLegacy/haiku/WebCoreSupport/ChromeClientHaiku.cpp haikuwebkit/Source/WebKitLegacy/haiku/WebCoreSupport/ChromeClientHaiku.cpp
 --- orig/haikuwebkit/Source/WebKitLegacy/haiku/WebCoreSupport/ChromeClientHaiku.cpp
 +++ haikuwebkit/Source/WebKitLegacy/haiku/WebCoreSupport/ChromeClientHaiku.cpp

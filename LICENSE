@@ -1,7 +1,7 @@
-The patch in webkit/ modifies HaikuWebKit, which is distributed under the
+The patches in webkit/ modify HaikuWebKit, which is distributed under the
 GNU Library General Public License version 2 (or later) and BSD licences, file
-by file. The patch is distributed under the same terms as the files it
-changes. The files it adds (HLSMediaIOHaiku, HaikuMSESample.h,
+by file. The patches are distributed under the same terms as the files they
+change. The files they add (HLSMediaIOHaiku, HaikuMSESample.h,
 MediaPlayerPrivateHaikuMSE, MediaSourcePrivateHaiku, SourceBufferPrivateHaiku)
 are Copyright (C) 2026 rainygirl and are distributed under the GNU Library
 General Public License version 2 or later, as stated in their headers.

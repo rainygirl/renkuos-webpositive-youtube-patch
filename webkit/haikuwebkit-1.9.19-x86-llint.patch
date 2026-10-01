@@ -1,0 +1,964 @@
+--- haikuwebkit/Source/JavaScriptCore/offlineasm/x86.rb.orig
++++ haikuwebkit/Source/JavaScriptCore/offlineasm/x86.rb
+@@ -1,3 +1,4 @@
++require "set"
+ # Copyright (C) 2012-2020 Apple Inc. All rights reserved.
+ # Copyright (C) 2013 Digia Plc. and/or its subsidiary(-ies)
+ #
+@@ -26,6 +27,20 @@
+ 
+ # GPR conventions, to match the baseline JIT:
+ #
++# On 32-bit x86 (restored for Haiku; upstream dropped it in 2024)
++# a0, a1, a2, a3 are only there for ease-of-use of offlineasm; they are not
++# actually considered as such by the ABI and arguments are pushed on the
++# stack. a0 and a1 are ecx and edx, as for fastcall.
++#
++# eax => t0, a2, r0
++# edx => t1, a1, r1
++# ecx => t2, a0
++# ebx => t3, a3     (callee-save)
++# esi => t4         (callee-save)
++# edi => t5         (callee-save)
++# ebp => cfr
++# esp => sp
++#
+ # On x86-64 (windows and non-windows)
+ #
+ # rax => t0,     r0
+@@ -45,6 +60,17 @@
+ # rbp => cfr
+ # r11 =>                  (scratch)
+ 
++def isX64
++    case $activeBackend
++    when "X86"
++        false
++    when "X86_64"
++        true
++    else
++        raise "bad value for $activeBackend: #{$activeBackend}"
++    end
++end
++
+ def isWin
+     $options.has_key?(:platform) && $options[:platform] == "Windows"
+ end
+@@ -80,6 +106,7 @@
+ class SpecialRegister < NoChildren
+     def x86Operand(kind)
+         raise unless @name =~ /^r/
++        raise unless isX64
+         case kind
+         when :half
+             register(@name + "w")
+@@ -110,9 +137,11 @@
+         name16 = name[1..2]
+         name8 = name16 + 'l'
+     when "rax", "rbx", "rcx", "rdx"
++        raise "bad GPR name #{name} in 32-bit X86" unless isX64
+         name8 = name[1] + 'l'
+         name16 = name[1..2]
+     when "r8", "r9", "r10", "r12", "r13", "r14", "r15"
++        raise "bad GPR name #{name} in 32-bit X86" unless isX64
+         case kind
+         when :byte
+             return register(name + "b")
+@@ -138,9 +167,9 @@
+     when :int
+         register("e" + name16)
+     when :ptr
+-        register("r" + name16)
++        register((isX64 ? "r" : "e") + name16)
+     when :quad
+-        register("r" + name16)
++        isX64 ? register("r" + name16) : raise
+     else
+         raise "invalid kind #{kind} for GPR #{name} in X86"
+     end
+@@ -165,6 +194,30 @@
+     end
+ 
+     def x86GPR
++        if not isX64
++            case name
++            when "t0", "r0", "a2"
++                return "eax"
++            when "t1", "r1", "a1"
++                return "edx"
++            when "t2", "a0"
++                return "ecx"
++            when "t3", "a3"
++                return "ebx"
++            when "t4"
++                return "esi"
++            when "t5"
++                return "edi"
++            when "cfr"
++                return "ebp"
++            when "sp"
++                return "esp"
++            when "csr0", "csr1"
++                raise "#{name} is a frame slot on 32-bit X86 and should have been rewritten (#{codeOriginString})"
++            else
++                raise "cannot use register #{name} on 32-bit X86 (#{codeOriginString})"
++            end
++        end
+         case name
+         when "t0", "r0", "ws0"
+             "eax"
+@@ -333,6 +386,7 @@
+ 
+ class Immediate
+     def validX86Immediate?
++        return true unless isX64
+         value >= -0x80000000 and value <= 0x7fffffff
+     end
+     def x86Operand(kind)
+@@ -395,6 +449,16 @@
+     end
+ end
+ 
++# 32-bit x86 has no PC-relative data addressing. Going through the GOT costs a
++# call/pop pair and two more instructions on every dispatch, which measured
++# 25% of a tight loop on an Atom Z520. The address is an absolute immediate
++# instead; the linker turns it into a text relocation, which Haiku's
++# runtime_loader applies, at the cost of the LLInt's text pages becoming
++# private to the process.
++def x86LoadLabelAddress32(asmLabel, dstOperand)
++    $asm.puts "movl $#{asmLabel}, #{dstOperand}"
++end
++
+ class LabelReference
+     def x86CallOperand(kind)
+         asmLabel
+@@ -403,7 +467,9 @@
+         # FIXME: Implement this on platforms that aren't Mach-O.
+         # https://bugs.webkit.org/show_bug.cgi?id=175104
+         used
+-        if !isWin
++        if !isX64
++            x86LoadLabelAddress32(asmLabel, dst.x86Operand(:ptr))
++        elsif !isWin
+             $asm.puts "movq #{asmLabel}@GOTPCREL(%rip), #{dst.x86Operand(:ptr)}"
+         else
+             $asm.puts "lea #{asmLabel}@GOTPCREL(%rip), #{dst.x86Operand(:ptr)}"
+@@ -421,7 +487,155 @@
+     end
+ end
+ 
++# On 32-bit x86 there are six usable GPRs, all taken by t0..t5. The two
++# registers the 32-bit LLInt keeps for the whole of a function --
++# metadataTable (csr0) and PB (csr1) -- live instead in the callee-save area
++# of the frame, at -8 and -4 from cfr, the slots ARMv7 uses to save them.
++# Every instruction that names one is rewritten here into instructions on
++# real registers:
++#   - a load whose address uses one borrows its own destination register:
++#     the slot is loaded into it first (this is the operand fetch,
++#     [PB, PC, 1], and so the hot path);
++#   - a compare or a two-operand ALU instruction reads the slot as its one
++#     memory operand;
++#   - anything else borrows a register it does not use, saved around the
++#     rewritten instruction with push/pop.
++X86_VIRTUAL_CSR_OFFSETS = { "csr0" => -8, "csr1" => -4 }
++X86_SCRATCH_CANDIDATES = ["t0", "t1", "t2", "t3", "t5"]
++
++def x86VirtualCSR?(node)
++    node.is_a? RegisterID and X86_VIRTUAL_CSR_OFFSETS.has_key? node.name
++end
++
++def x86CSRSlot(codeOrigin, csr)
++    Address.new(codeOrigin, RegisterID.forName(codeOrigin, "cfr"), Immediate.new(codeOrigin, X86_VIRTUAL_CSR_OFFSETS[csr.name]))
++end
++
++def x86RegistersIn(node, set)
++    if node.is_a? RegisterID
++        set << node.name
++    elsif node.is_a? Address
++        x86RegistersIn(node.base, set)
++    elsif node.is_a? BaseIndex
++        x86RegistersIn(node.base, set)
++        x86RegistersIn(node.index, set)
++    end
++    set
++end
++
++def x86ReplaceRegister(node, from, to)
++    if node.is_a? RegisterID
++        node.name == from ? to : node
++    elsif node.is_a? Address
++        Address.new(node.codeOrigin, x86ReplaceRegister(node.base, from, to), node.offset)
++    elsif node.is_a? BaseIndex
++        BaseIndex.new(node.codeOrigin, x86ReplaceRegister(node.base, from, to), x86ReplaceRegister(node.index, from, to), node.scale, node.offset)
++    else
++        node
++    end
++end
++
++# push moves esp; an esp-based address inside the wrapped instruction has to
++# account for it.
++def x86AdjustForPush(node, bytes)
++    if node.is_a? Address and node.base.is_a? RegisterID and node.base.name == "sp"
++        node.withOffset(bytes)
++    elsif node.is_a? BaseIndex and node.base.is_a? RegisterID and node.base.name == "sp"
++        node.withOffset(bytes)
++    else
++        node
++    end
++end
++
++X86_BRANCH_LIKE = /^(b|j)/
++
++def x86RewriteVirtualCSR(node, newList)
++    usedList = []
++    node.operands.each { |op| x86RegistersIn(op, usedList) }
++    used = Set.new(usedList)
++    csrNames = used.select { |name| X86_VIRTUAL_CSR_OFFSETS.has_key? name }
++    if csrNames.empty?
++        newList << node
++        return
++    end
++    raise "Instruction uses both PB and metadataTable at #{node.codeOriginString}" if csrNames.size > 1
++    csr = RegisterID.forName(node.codeOrigin, csrNames[0])
++    slot = x86CSRSlot(node.codeOrigin, csr)
++    origin = node.codeOrigin
++    ops = node.operands
++    last = ops[-1]
++    csrIsPlain = ops.map { |op| x86VirtualCSR?(op) }
++
++    case node.opcode
++    when "push", "pop"
++        newList << Instruction.new(origin, node.opcode, ops.map { |op| x86VirtualCSR?(op) ? slot : op })
++        return
++    when "move"
++        if x86VirtualCSR?(ops[0]) and ops[1].is_a? RegisterID and not x86VirtualCSR?(ops[1])
++            newList << Instruction.new(origin, "loadp", [slot, ops[1]])
++            return
++        end
++        if x86VirtualCSR?(ops[1]) and ops[0].is_a? RegisterID
++            newList << Instruction.new(origin, "storep", [ops[0], slot])
++            return
++        end
++    end
++
++    # A load into a real register: the destination is free until the load
++    # writes it, so it carries the slot's value.
++    if node.opcode =~ /^load/ and last.is_a? RegisterID and not x86VirtualCSR?(last) and ops.size == 2 and not x86VirtualCSR?(ops[0])
++        addressRegisters = x86RegistersIn(ops[0], Set.new)
++        unless addressRegisters.include? last.name
++            newList << Instruction.new(origin, "loadp", [slot, last])
++            newList << Instruction.new(origin, node.opcode, [x86ReplaceRegister(ops[0], csr.name, last), last], node.annotation)
++            return
++        end
++    end
++
++    # The slot as the one memory operand of a compare/branch or of a
++    # two-operand ALU instruction on a real register.
++    plainUses = csrIsPlain.count(true)
++    memoryOperands = ops.count { |op| op.is_a? Address or op.is_a? BaseIndex or op.is_a? AbsoluteAddress }
++    if plainUses == 1 and memoryOperands == 0 and usedList.count(csr.name) == 1
++        twoOperandALU = (["addp", "subp", "andp", "orp", "xorp", "addi", "subi"].include?(node.opcode) && ops.size == 2 && x86VirtualCSR?(ops[0]) && last.is_a?(RegisterID))
++        if (node.opcode =~ X86_BRANCH_LIKE) || twoOperandALU
++            newList << Instruction.new(origin, node.opcode, ops.map { |op| x86VirtualCSR?(op) ? slot : op }, node.annotation)
++            return
++        end
++    end
++
++    raise "Cannot rewrite #{node.opcode} using #{csr.name} at #{node.codeOriginString}" if node.opcode =~ X86_BRANCH_LIKE
++
++    # General case: borrow a register the instruction does not use.
++    scratchName = X86_SCRATCH_CANDIDATES.find { |name| not used.include? name }
++    raise "No scratch register for #{node.opcode} at #{node.codeOriginString}" unless scratchName
++    scratch = RegisterID.forName(origin, scratchName)
++    writesCSR = (x86VirtualCSR?(last) && !(node.opcode =~ /^store/))
++    newList << Instruction.new(origin, "push", [scratch])
++    newList << Instruction.new(origin, "loadp", [slot.withOffset(0), scratch])
++    rewritten = ops.map { |op| x86AdjustForPush(x86ReplaceRegister(op, csr.name, scratch), 4) }
++    newList << Instruction.new(origin, node.opcode, rewritten, node.annotation)
++    newList << Instruction.new(origin, "storep", [scratch, slot]) if writesCSR
++    newList << Instruction.new(origin, "pop", [scratch])
++end
++
+ class Sequence
++    def getModifiedListX86
++        newList = []
++        @list.each {
++            | node |
++            if node.is_a? Instruction
++                x86RewriteVirtualCSR(node, newList)
++            else
++                unless node.is_a? Label or node.is_a? LocalLabel or node.is_a? Skip
++                    raise "Unexpected #{node.inspect} at #{node.codeOrigin}"
++                end
++                newList << node
++            end
++        }
++        newList
++    end
++
+     def getModifiedListX86_64
+         newList = []
+         
+@@ -488,9 +702,9 @@
+         when :int
+             "l"
+         when :ptr
+-            "q"
++            isX64 ? "q" : "l"
+         when :quad
+-            "q"
++            isX64 ? "q" : raise
+         when :float
+             "ss"
+         when :double
+@@ -509,9 +723,9 @@
+         when :int
+             4
+         when :ptr
+-            8
++            isX64 ? 8 : 4
+         when :quad
+-            8
++            isX64 ? 8 : raise
+         when :float
+             4
+         when :double
+@@ -524,7 +738,9 @@
+     def emitX86Lea(src, dst, kind)
+         if src.is_a? LabelReference
+             src.used
+-            if !isWin
++            if !isX64
++                x86LoadLabelAddress32(src.asmLabel, dst.x86Operand(:ptr))
++            elsif !isWin
+                 $asm.puts "movq #{src.asmLabel}@GOTPCREL(%rip), #{dst.x86Operand(:ptr)}"
+             else
+                 $asm.puts "lea #{src.asmLabel}@GOTPCREL(%rip), #{dst.x86Operand(:ptr)}"
+@@ -871,10 +1087,11 @@
+     end
+ 
+     def handleMove
++        kind = isX64 ? :quad : :ptr
+         if Immediate.new(nil, 0) == operands[0] and operands[1].is_a? RegisterID
+-            $asm.puts "xor#{x86Suffix(:quad)} #{operands[1].x86Operand(:quad)}, #{operands[1].x86Operand(:quad)}"
+-        elsif operands[0].x86Operand(:quad) != operands[1].x86Operand(:quad)
+-            $asm.puts "mov#{x86Suffix(:quad)} #{x86Operands(:quad, :quad)}"
++            $asm.puts "xor#{x86Suffix(kind)} #{operands[1].x86Operand(kind)}, #{operands[1].x86Operand(kind)}"
++        elsif operands[0].x86Operand(kind) != operands[1].x86Operand(kind)
++            $asm.puts "mov#{x86Suffix(kind)} #{x86Operands(kind, kind)}"
+         end
+     end
+ 
+@@ -992,6 +1209,11 @@
+         ]).lower($activeBackend)
+     end
+ 
++    def lowerX86
++        raise unless $activeBackend == "X86"
++        lowerX86Common
++    end
++
+     def lowerX86_64
+         raise unless $activeBackend == "X86_64"
+         lowerX86Common
+@@ -1088,7 +1310,11 @@
+         when "storei"
+             $asm.puts "mov#{x86Suffix(:int)} #{x86Operands(:int, :int)}"
+         when "loadis"
+-            $asm.puts "movslq #{x86LoadOperands(:int, :quad)}"
++            if isX64
++                $asm.puts "movslq #{x86LoadOperands(:int, :quad)}"
++            else
++                $asm.puts "mov#{x86Suffix(:int)} #{x86LoadOperands(:int, :int)}"
++            end
+         when "loadp"
+             $asm.puts "mov#{x86Suffix(:ptr)} #{x86LoadOperands(:ptr, :ptr)}"
+         when "storep"
+@@ -1288,24 +1514,24 @@
+         when "pop"
+             operands.each {
+                 | op |
+-                $asm.puts "pop #{op.x86Operand(:ptr)}"
++                $asm.puts "pop#{isX64 ? "" : "l"} #{op.x86Operand(:ptr)}"
+             }
+         when "popv"
+             operands.each {
+                 | op |
+-                $asm.puts "movdqu (%rsp), #{op.x86Operand(:vector)}"
+-                $asm.puts "add $16, %rsp"
++                $asm.puts "movdqu (#{isX64 ? "%rsp" : "%esp"}), #{op.x86Operand(:vector)}"
++                $asm.puts "add $16, #{isX64 ? "%rsp" : "%esp"}"
+             }
+         when "push"
+             operands.each {
+                 | op |
+-                $asm.puts "push #{op.x86Operand(:ptr)}"
++                $asm.puts "push#{isX64 ? "" : "l"} #{op.x86Operand(:ptr)}"
+             }
+         when "pushv"
+             operands.each {
+                 | op |
+-                $asm.puts "sub $16, %rsp"
+-                $asm.puts "movdqu #{op.x86Operand(:vector)}, (%rsp)"
++                $asm.puts "sub $16, #{isX64 ? "%rsp" : "%esp"}"
++                $asm.puts "movdqu #{op.x86Operand(:vector)}, (#{isX64 ? "%rsp" : "%esp"})"
+             }
+         when "move"
+             handleMove
+@@ -1697,6 +1923,7 @@
+             $asm.puts "movd #{orderOperands(X64_SCRATCH_REGISTER.x86Operand(:quad), operands[1].x86Operand(:double))}"
+             $asm.puts "xorpd #{orderOperands(operands[0].x86Operand(:double), operands[1].x86Operand(:double))}"
+         when "tls_loadp"
++            raise "tls_loadp is only supported on x64" unless isX64
+             if operands[0].immediate?
+                 mem = "%gs:#{operands[0].value * 8}"
+             else
+@@ -1704,6 +1931,7 @@
+             end
+             $asm.puts "movq #{orderOperands(mem, operands[1].x86Operand(:quad))}"
+         when "tls_loadp"
++            raise "tls_loadp is only supported on x64" unless isX64
+             if operands[0].immediate?
+                 mem = "%gs:#{operands[0].value * x86Bytes(:ptr)}"
+             else
+@@ -1711,6 +1939,7 @@
+             end
+             $asm.puts "mov#{x86Suffix(:ptr)} #{orderOperands(mem, operands[1].x86Operand(:quad))}"
+         when "tls_storep"
++            raise "tls_storep is only supported on x64" unless isX64
+             if operands[1].immediate?
+                 mem = "%gs:#{operands[1].value * x86Bytes(:ptr)}"
+             else
+--- haikuwebkit/Source/JavaScriptCore/offlineasm/backends.rb.orig
++++ haikuwebkit/Source/JavaScriptCore/offlineasm/backends.rb
+@@ -36,6 +36,7 @@
+ 
+ BACKENDS =
+     [
++     "X86",
+      "X86_64",
+      "ARMv7",
+      "ARM64",
+@@ -51,6 +52,7 @@
+ # the future while not actually supporting the backend yet.
+ WORKING_BACKENDS =
+     [
++     "X86",
+      "X86_64",
+      "ARMv7",
+      "ARM64",
+--- haikuwebkit/Source/JavaScriptCore/llint/LowLevelInterpreter.asm.orig
++++ haikuwebkit/Source/JavaScriptCore/llint/LowLevelInterpreter.asm
+@@ -225,7 +225,8 @@
+     const CalleeSaveSpaceAsVirtualRegisters = 4
+ elsif C_LOOP
+     const CalleeSaveSpaceAsVirtualRegisters = 1
+-elsif ARMv7
++elsif ARMv7 or X86
++    # On 32-bit x86 this slot is where PB and metadataTable live (see x86.rb).
+     const CalleeSaveSpaceAsVirtualRegisters = 1
+ else
+     const CalleeSaveSpaceAsVirtualRegisters = 0
+@@ -303,6 +304,11 @@
+     elsif ARMv7
+         const metadataTable = csr0
+         const PB = csr1
++    elsif X86
++        # Not machine registers on 32-bit x86: x86.rb maps csr0 and csr1 to
++        # the frame slots at -8 and -4 from cfr.
++        const metadataTable = csr0
++        const PB = csr1
+     else
+         error
+     end
+@@ -762,6 +768,8 @@
+     const CalleeSaveRegisterCount = 0
+ elsif ARMv7
+     const CalleeSaveRegisterCount = 5 + 2 * 2 // 5 32-bit GPRs + 2 64-bit FPRs
++elsif X86
++    const CalleeSaveRegisterCount = 3 // esi, edi, ebx: t4 (PC), t5, t3
+ end
+ 
+ const CalleeRegisterSaveSize = CalleeSaveRegisterCount * MachineRegisterSize
+@@ -779,6 +787,10 @@
+     elsif ARMv7
+         emit "vpush.64 {d14, d15}"
+         emit "push {r4-r6, r8-r9}"
++    elsif X86
++        emit "push %esi"
++        emit "push %edi"
++        emit "push %ebx"
+     end
+ end
+ 
+@@ -787,6 +799,10 @@
+     elsif ARMv7
+         emit "pop {r4-r6, r8-r9}"
+         emit "vpop.64 {d14, d15}"
++    elsif X86
++        emit "pop %ebx"
++        emit "pop %edi"
++        emit "pop %esi"
+     end
+ end
+ 
+@@ -794,7 +810,7 @@
+     if C_LOOP or ARMv7
+         push lr
+         push cfr
+-    elsif X86_64
++    elsif X86_64 or X86
+         push cfr
+     elsif ARM64 or ARM64E or RISCV64
+         push cfr, lr
+@@ -809,7 +825,7 @@
+     if C_LOOP or ARMv7
+         pop cfr
+         pop lr
+-    elsif X86_64
++    elsif X86_64 or X86
+         pop cfr
+     elsif ARM64 or ARM64E or RISCV64
+         pop lr, cfr
+@@ -823,6 +839,9 @@
+     elsif ARMv7
+         storep PB, -4[cfr]
+         storep metadataTable, -8[cfr]
++    elsif X86
++        # PB and metadataTable already live in these slots; the caller's are
++        # in the caller's frame. Nothing to save.
+     elsif ARM64 or ARM64E
+         storepairq csr8, csr9, -16[cfr]
+         storepairq csr6, csr7, -32[cfr]
+@@ -845,6 +864,7 @@
+     elsif ARMv7
+         loadp -4[cfr], PB
+         loadp -8[cfr], metadataTable
++    elsif X86
+     elsif ARM64 or ARM64E
+         loadpairq -32[cfr], csr6, csr7
+         loadpairq -16[cfr], csr8, csr9
+@@ -1026,7 +1046,7 @@
+     if C_LOOP or ARMv7 or ARM64 or ARM64E or RISCV64
+         # In C_LOOP case, we're only preserving the bytecode vPC.
+         move lr, destinationRegister
+-    elsif X86_64
++    elsif X86_64 or X86
+         pop destinationRegister
+     else
+         error
+@@ -1035,7 +1055,7 @@
+ 
+ macro functionPrologue()
+     tagReturnAddress sp
+-    if X86_64
++    if X86_64 or X86
+         push cfr
+     elsif ARM64 or ARM64E or RISCV64
+         push cfr, lr
+@@ -1047,7 +1067,7 @@
+ end
+ 
+ macro functionEpilogue()
+-    if X86_64
++    if X86_64 or X86
+         pop cfr
+     elsif ARM64 or ARM64E or RISCV64
+         pop lr, cfr
+@@ -1830,7 +1850,14 @@
+ # a0 and a1 are used. a2 contains function address.
+ global _vmEntryHostFunction
+ _vmEntryHostFunction:
++if X86
++    loadp 12[sp], t0
++    loadp 4[sp], a0
++    loadp 8[sp], a1
++    jmp t0, HostFunctionPtrTag
++else
+     jmp a2, HostFunctionPtrTag
++end
+ 
+ if ARM64E
+     # unsigned vmEntryToCSSJIT(uintptr_t, uintptr_t, uintptr_t, const void* codePtr);
+@@ -1849,6 +1876,10 @@
+     global _sanitizeStackForVMImpl
+     _sanitizeStackForVMImpl:
+         tagReturnAddress sp
++        if X86
++            # cdecl: the argument is on the stack.
++            loadp 4[sp], a0
++        end
+         const address = a1
+         const scratch = a2
+ 
+@@ -1894,6 +1925,9 @@
+     global _vmEntryRecord
+     _vmEntryRecord:
+         tagReturnAddress sp
++        if X86
++            loadp 4[sp], a0
++        end
+         vmEntryRecord(a0, r0)
+         ret
+ end
+@@ -1975,7 +2009,7 @@
+         crash()
+ else
+     macro initPCRelative(kind, pcBase)
+-        if X86_64
++        if X86_64 or X86
+             call _%kind%_relativePCBase
+         _%kind%_relativePCBase:
+             pop pcBase
+@@ -2009,6 +2043,10 @@
+             addp t4, t3, t4
+             move index, t5
+             storep t4, [map, t5, 4]
++        elsif X86
++            leap (label - _%kind%_relativePCBase)[t3], t4
++            move index, t5
++            storep t4, [map, t5, 4]
+         end
+     end
+ 
+@@ -2036,6 +2074,12 @@
+     _%kind%_entry:
+         functionPrologue()
+         pushCalleeSaves()
++        if X86
++            # cdecl: past the return address, cfr and three callee saves.
++            loadp 20[sp], a0
++            loadp 24[sp], a1
++            loadp 28[sp], a2
++        end
+ 
+         initPCRelative(kind, t3)
+ 
+@@ -2695,9 +2739,14 @@
+     end
+ 
+     bbneq JSCell::m_type[t0], JSFunctionType, .slowCase
+-    loadp JSFunction::m_executableOrRareData[t0], t6
+-    btpz t6, (constexpr JSFunction::rareDataTag), .isExecutable
+-    loadp (FunctionRareData::m_executable - (constexpr JSFunction::rareDataTag))[t6], t6
++    if X86
++        const executable = t4
++    else
++        const executable = t6
++    end
++    loadp JSFunction::m_executableOrRareData[t0], executable
++    btpz executable, (constexpr JSFunction::rareDataTag), .isExecutable
++    loadp (FunctionRareData::m_executable - (constexpr JSFunction::rareDataTag))[executable], executable
+ .isExecutable:
+ 
+     loadp CallLinkInfo::m_stub[t2], t5
+@@ -2705,7 +2754,7 @@
+ 
+ .loop:
+     loadp CallSlot::m_calleeOrExecutable[t5], t3
+-    bpeq t3, t6, .found
++    bpeq t3, executable, .found
+     btpz t3, .slowCase
+     addp (constexpr (sizeof(CallSlot))), t5
+     jmp .loop
+--- haikuwebkit/Source/JavaScriptCore/llint/LowLevelInterpreter32_64.asm.orig
++++ haikuwebkit/Source/JavaScriptCore/llint/LowLevelInterpreter32_64.asm
+@@ -143,11 +143,20 @@
+     dispatch()
+ end
+ 
++# 32-bit x86 passes C arguments on the stack (cdecl). Every call keeps esp
++# 16-byte aligned at the call instruction, as the i386 System V ABI that GCC
++# compiles the callees for assumes.
+ macro cCall2(function)
+     if C_LOOP
+         cloopCallSlowPath function, a0, a1
+     elsif ARMv7
+         call function
++    elsif X86
++        subp 8, sp
++        push a1
++        push a0
++        call function
++        addp 16, sp
+     else
+         error
+     end
+@@ -166,6 +175,13 @@
+         cloopCallSlowPath3 function, a0, a1, a2
+     elsif ARMv7
+         call function
++    elsif X86
++        subp 4, sp
++        push a2
++        push a1
++        push a0
++        call function
++        addp 16, sp
+     else
+         error
+     end
+@@ -176,6 +192,13 @@
+         cloopCallSlowPath4 function, a0, a1, a2, a3
+     elsif ARMv7
+         call function
++    elsif X86
++        push a3
++        push a2
++        push a1
++        push a0
++        call function
++        addp 16, sp
+     else
+         error
+     end
+@@ -205,6 +228,14 @@
+     functionPrologue()
+     pushCalleeSaves()
+ 
++    if X86
++        # cdecl: entry, vm and protoCallFrame are on the stack, above the
++        # return address and the saved cfr.
++        loadp 8[cfr], a0
++        loadp 12[cfr], a1
++        loadp 16[cfr], a2
++    end
++
+     const entry = a0
+     const vm = a1
+     const protoCallFrame = a2
+@@ -232,6 +263,11 @@
+         clrbp t3, StackAlignmentMask, t3
+         subp t3, CallFrameAlignSlots * SlotSize, t3
+         move t3, sp
++    elsif X86
++        addp CallFrameAlignSlots * SlotSize, sp, t3
++        andp ~StackAlignmentMask, t3
++        subp t3, CallFrameAlignSlots * SlotSize, t3
++        move t3, sp
+     end
+ 
+     loadi ProtoCallFrame::paddedArgCount[protoCallFrame], t4
+@@ -388,6 +424,13 @@
+         move sp, a1
+         storep lr, PtrSize[sp]
+         cloopCallNative temp1
++    elsif X86
++        # Host functions are fastcall on 32-bit x86: JSGlobalObject* in ecx
++        # (a0), CallFrame* in edx (a1). entry was a0 and is in temp1 now.
++        storep 0, PtrSize[sp]
++        loadp ProtoCallFrame::globalObject[protoCallFrame], a0
++        move sp, a1
++        call temp1
+     else
+         loadp ProtoCallFrame::globalObject[protoCallFrame], a0
+         move sp, a1
+@@ -2351,7 +2394,7 @@
+     bineq t1, CellTag, .opCallSlow
+     loadp %opcodeStruct%::Metadata::m_callLinkInfo.m_callee[t5], t3
+     btpz t3, (constexpr CallLinkInfo::polymorphicCalleeMask), .notPolymorphic
+-    prepareCall(t2, t3, t4, t6, macro(address)
++    prepareCall(t2, t3, t4, t5, macro(address)
+         loadp %opcodeStruct%::Metadata::m_callLinkInfo.m_codeBlock[t5], t2
+         storep t2, address
+     end)
+@@ -2360,7 +2403,7 @@
+ 
+ .notPolymorphic:
+     bpneq t0, t3, .opCallSlow
+-    prepareCall(t2, t3, t4, t6, macro(address)
++    prepareCall(t2, t3, t4, t5, macro(address)
+         loadp %opcodeStruct%::Metadata::m_callLinkInfo.m_codeBlock[t5], t2
+         storep t2, address
+     end)
+@@ -2373,7 +2416,7 @@
+ .opCallSlow:
+     # 64bit:t0 32bit(t0,t1) is callee
+     # t2 is CallLinkInfo*
+-    prepareCall(t2, t3, t4, t6, macro(address)
++    prepareCall(t2, t3, t4, t5, macro(address)
+         storep 0, address
+     end)
+     addp %opcodeStruct%::Metadata::m_callLinkInfo, t5, t2 # CallLinkInfo* in t2
+@@ -2436,7 +2479,7 @@
+             bineq t1, CellTag, .opCallSlow
+             loadp %opcodeStruct%::Metadata::m_callLinkInfo.m_callee[t5], t3
+             btpz t3, (constexpr CallLinkInfo::polymorphicCalleeMask), .notPolymorphic
+-            prepareCall(t2, t3, t4, t6, macro(address)
++            prepareCall(t2, t3, t4, t5, macro(address)
+                 loadp %opcodeStruct%::Metadata::m_callLinkInfo.m_codeBlock[t5], t2
+                 storep t2, address
+             end)
+@@ -2445,7 +2488,7 @@
+ 
+         .notPolymorphic:
+             bpneq t0, t3, .opCallSlow
+-            prepareCall(t2, t3, t4, t6, macro(address)
++            prepareCall(t2, t3, t4, t5, macro(address)
+                 loadp %opcodeStruct%::Metadata::m_callLinkInfo.m_codeBlock[t5], t2
+                 storep t2, address
+             end)
+@@ -2458,7 +2501,7 @@
+         .opCallSlow:
+             # 64bit:t0 32bit(t0,t1) is callee
+             # t2 is CallLinkInfo*
+-            prepareCall(t2, t3, t4, t6, macro(address)
++            prepareCall(t2, t3, t4, t5, macro(address)
+                 storep 0, address
+             end)
+             addp %opcodeStruct%::Metadata::m_callLinkInfo, t5, t2 # CallLinkInfo* in t2
+--- haikuwebkit/Source/JavaScriptCore/llint/LLIntOfflineAsmConfig.h.orig
++++ haikuwebkit/Source/JavaScriptCore/llint/LLIntOfflineAsmConfig.h
+@@ -32,6 +32,7 @@
+ 
+ #if ENABLE(C_LOOP)
+ #define OFFLINE_ASM_C_LOOP 1
++#define OFFLINE_ASM_X86 0
+ #define OFFLINE_ASM_ARMv7 0
+ #define OFFLINE_ASM_ARM64 0
+ #define OFFLINE_ASM_ARM64E 0
+@@ -68,6 +69,12 @@
+ #define OFFLINE_ASM_X86_64 0
+ #endif
+ 
++#if CPU(X86)
++#define OFFLINE_ASM_X86 1
++#else
++#define OFFLINE_ASM_X86 0
++#endif
++
+ #if CPU(ARM64)
+ #define OFFLINE_ASM_ARM64 1
+ #else
+--- haikuwebkit/Source/JavaScriptCore/llint/LLIntPCRanges.h.orig
++++ haikuwebkit/Source/JavaScriptCore/llint/LLIntPCRanges.h
+@@ -61,7 +61,7 @@
+ }
+ #endif
+ 
+-#if !ENABLE(C_LOOP)
++#if ENABLE(ASSEMBLER)
+ static constexpr GPRReg LLIntPC = GPRInfo::regT4;
+ #endif
+ 
+--- haikuwebkit/Source/JavaScriptCore/CMakeLists.txt.orig
++++ haikuwebkit/Source/JavaScriptCore/CMakeLists.txt
+@@ -274,6 +274,8 @@
+ 
+ if (WTF_CPU_X86_64)
+     set(OFFLINE_ASM_BACKEND "X86_64")
++elseif (WTF_CPU_X86)
++    set(OFFLINE_ASM_BACKEND "X86")
+ elseif (WTF_CPU_ARM64)
+     set(OFFLINE_ASM_BACKEND "ARM64")
+ elseif (ARM_THUMB2_DETECTED)
+--- haikuwebkit/Source/WTF/wtf/PlatformEnable.h.orig
++++ haikuwebkit/Source/WTF/wtf/PlatformEnable.h
+@@ -818,8 +818,9 @@
+ #endif
+ 
+ /* If either the JIT or the RegExp JIT is enabled, then the Assembler must be
+-   enabled as well: */
+-#if ENABLE(JIT) || ENABLE(YARR_JIT) || !ENABLE(C_LOOP)
++   enabled as well. The asm LLInt alone does not need it, and on 32-bit x86
++   there is no MacroAssembler any more: that interpreter is built without. */
++#if ENABLE(JIT) || ENABLE(YARR_JIT) || (!ENABLE(C_LOOP) && !CPU(X86))
+ #if defined(ENABLE_ASSEMBLER) && !ENABLE_ASSEMBLER
+ #error "Cannot enable the JIT or RegExp JIT without enabling the Assembler"
+ #else
+--- haikuwebkit/Source/JavaScriptCore/assembler/CPU.h.orig
++++ haikuwebkit/Source/JavaScriptCore/assembler/CPU.h
+@@ -203,7 +203,7 @@
+ #if ENABLE(C_LOOP)
+     // Prologue saves the framePointerRegister and linkRegister
+     return 2 * sizeof(CPURegister);
+-#elif CPU(X86_64)
++#elif CPU(X86_64) || CPU(X86)
+     // Prologue only saves the framePointerRegister
+     return sizeof(CPURegister);
+ #elif CPU(ARM_THUMB2) || CPU(ARM64) || CPU(RISCV64)
+--- haikuwebkit/Source/JavaScriptCore/interpreter/CallFrame.h.orig
++++ haikuwebkit/Source/JavaScriptCore/interpreter/CallFrame.h
+@@ -117,7 +117,7 @@
+     };
+     static_assert(CallerFrameAndPC::sizeInRegisters == sizeof(CallerFrameAndPC) / sizeof(Register), "CallerFrameAndPC::sizeInRegisters is incorrect.");
+     static_assert(sizeof(CallerFrameAndPC) >= prologueStackPointerDelta());
+-#if !CPU(X86_64)
++#if !CPU(X86_64) && !CPU(X86)
+     // Only x86_64 "call" pushes return address on the stack. Other architecture pushes in the function prologue after the call.
+     static_assert(sizeof(CallerFrameAndPC) == prologueStackPointerDelta());
+ #endif
+--- haikuwebkit/Source/JavaScriptCore/jit/RegisterSet.h.orig
++++ haikuwebkit/Source/JavaScriptCore/jit/RegisterSet.h
+@@ -25,7 +25,7 @@
+ 
+ #pragma once
+ 
+-#if !ENABLE(C_LOOP)
++#if ENABLE(ASSEMBLER)
+ 
+ #include "FPRInfo.h"
+ #include "GPRInfo.h"
+@@ -560,4 +560,4 @@
+ 
+ } // namespace WTF
+ 
+-#endif // !ENABLE(C_LOOP)
++#endif // ENABLE(ASSEMBLER)
+--- haikuwebkit/Source/JavaScriptCore/jit/JITCode.cpp.orig
++++ haikuwebkit/Source/JavaScriptCore/jit/JITCode.cpp
+@@ -139,7 +139,7 @@
+     if (m_jitType == JITType::DFGJIT)
+         return &RegisterAtOffsetList::dfgCalleeSaveRegisters();
+ #endif
+-#if !ENABLE(C_LOOP)
++#if ENABLE(ASSEMBLER)
+     return &RegisterAtOffsetList::llintBaselineCalleeSaveRegisters();
+ #else
+     return nullptr;
+--- haikuwebkit/Source/JavaScriptCore/bytecode/CodeBlock.h.orig
++++ haikuwebkit/Source/JavaScriptCore/bytecode/CodeBlock.h
+@@ -621,7 +621,7 @@
+     JS_EXPORT_PRIVATE unsigned reoptimizationRetryCounter() const;
+     void countReoptimization();
+ 
+-#if !ENABLE(C_LOOP)
++#if ENABLE(ASSEMBLER)
+     static unsigned numberOfLLIntBaselineCalleeSaveRegisters() { return RegisterSetBuilder::llintBaselineCalleeSaveRegisters().numberOfSetRegisters(); }
+     static size_t llintBaselineCalleeSaveSpaceAsVirtualRegisters();
+     static size_t calleeSaveSpaceAsVirtualRegisters(const RegisterAtOffsetList&);
+--- haikuwebkit/Source/JavaScriptCore/bytecode/CodeBlock.cpp.orig
++++ haikuwebkit/Source/JavaScriptCore/bytecode/CodeBlock.cpp
+@@ -2407,7 +2407,7 @@
+ #endif // ENABLE(JIT)
+ }
+ 
+-#if !ENABLE(C_LOOP)
++#if ENABLE(ASSEMBLER)
+ size_t CodeBlock::llintBaselineCalleeSaveSpaceAsVirtualRegisters()
+ {
+     return WTF::roundUpToMultipleOf<sizeof(Register)>(numberOfLLIntBaselineCalleeSaveRegisters() * sizeof(CPURegister)) / sizeof(Register);
+--- haikuwebkit/Source/cmake/WebKitFeatures.cmake.orig
++++ haikuwebkit/Source/cmake/WebKitFeatures.cmake
+@@ -100,6 +100,12 @@
+         set(USE_SYSTEM_MALLOC_DEFAULT OFF)
+         set(ENABLE_C_LOOP_DEFAULT OFF)
+         set(ENABLE_SAMPLING_PROFILER_DEFAULT ON)
++    elseif (WTF_CPU_X86)
++        set(ENABLE_JIT_DEFAULT OFF)
++        set(ENABLE_FTL_DEFAULT OFF)
++        set(USE_SYSTEM_MALLOC_DEFAULT ON)
++        set(ENABLE_C_LOOP_DEFAULT OFF)
++        set(ENABLE_SAMPLING_PROFILER_DEFAULT OFF)
+     elseif (WTF_CPU_MIPS AND WTF_OS_LINUX)
+         set(ENABLE_JIT_DEFAULT OFF)
+         set(ENABLE_FTL_DEFAULT OFF)
+@@ -120,7 +126,7 @@
+         set(ENABLE_SAMPLING_PROFILER_DEFAULT OFF)
+     endif ()
+ 
+-    if (ENABLE_C_LOOP_DEFAULT)
++    if (ENABLE_C_LOOP_DEFAULT OR WTF_CPU_X86)
+         set(ENABLE_WEBASSEMBLY_DEFAULT OFF)
+     else ()
+         set(ENABLE_WEBASSEMBLY_DEFAULT ON)

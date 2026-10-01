@@ -1,5 +1,5 @@
 name			haikuwebkit_x86
-version			1.9.19-21
+version			1.9.19-22
 architecture		x86_gcc2
 summary			"Open source web browser engine"
 description		"WebKit is an open source web browser engine. WebKit is also the name of the Mac OS X system framework version of the engine that's used by Safari, Dashboard, Mail, and many other OS X applications. WebKit's HTML and JavaScript code began as a branch of the KHTML and KJS libraries from KDE.
@@ -10,7 +10,9 @@ Since -4 it also registers the Haiku media engine, which HaikuWebKit never did: 
 
 Since -5 the player's clock counts the audio frames it actually played instead of trusting the decoder's timestamps, which the ffmpeg plugin's AAC decoder reports at about a twentieth of real time on MP4: playback crawled and the picture stalled.
 
--21 adds Media Source Extensions (fragmented MP4 with H.264 and AAC, decoded through the Media Kit), HTTP Live Streaming for <video>, opening media off the main thread, canPlayType() answers per codec, and a fix for the crash on quitting during playback. haikuwebkit_x86_media is provided so that webpositive_hwvideo can require this build."
+-21 adds Media Source Extensions (fragmented MP4 with H.264 and AAC, decoded through the Media Kit), HTTP Live Streaming for <video>, opening media off the main thread, canPlayType() answers per codec, and a fix for the crash on quitting during playback. haikuwebkit_x86_media is provided so that webpositive_hwvideo can require this build.
+
+-22 gives JavaScriptCore an assembly interpreter (LLInt) on 32-bit x86 in place of the portable C loop, about a quarter to a third faster; reuses a CSS filter's output while the filtered layer is unchanged, instead of blurring it again for every video frame; and stops Media Source playback before the Media Kit is torn down, which crashed WebPositive on quit."
 vendor			"rainygirl"
 packager		"rainygirl <rainygirl@gmail.com>"
 copyrights	{
