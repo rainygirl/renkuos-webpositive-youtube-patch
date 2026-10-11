@@ -16,7 +16,7 @@ a Sony VAIO P (Atom Z520, Intel GMA500).
 - **Media Source Extensions** (`ENABLE_MEDIA_SOURCE`): a SourceBuffer for
   fragmented MP4 with H.264 video and AAC audio, and a media engine that
   decodes it through the Media Kit -- the GMA500's hardware H.264 decoder
-  where there is one ([haiku-webpositive-msvdx](https://github.com/rainygirl/haiku-webpositive-msvdx)),
+  where there is one ([haiku-webpositive-msvdx](https://github.com/rainygirl/renkuos-webpositive-msvdx)),
   the ffmpeg plugin otherwise -- with the video timed against the audio and
   dropped frames reported to the page. WebM/VP9/AV1 are refused, so sites
   send H.264.
@@ -57,7 +57,7 @@ On the VAIO P, with the original user agent:
 
 `webkit/build-haikuwebkit-x86.sh` cross-builds `haikuwebkit_x86` 1.9.19-22
 on Linux. It runs
-[haiku-rwebpositive-arm64](https://github.com/rainygirl/haiku-rwebpositive-arm64)'s
+[haiku-rwebpositive-arm64](https://github.com/rainygirl/renkuos-rwebpositive-arm64)'s
 x86 build (memory-leak fixes) with this repository's two patches applied on
 top; set `RWP` to that checkout.
 

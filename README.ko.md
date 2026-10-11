@@ -14,7 +14,7 @@ GMA500)에서 개발하고 측정했습니다.
 
 - **Media Source Extensions** (`ENABLE_MEDIA_SOURCE`): H.264 영상과 AAC 음성의
   fragmented MP4를 받는 SourceBuffer와, 이를 Media Kit로 디코딩하는 미디어
-  엔진. GMA500이 있으면 하드웨어 H.264 디코더([haiku-webpositive-msvdx](https://github.com/rainygirl/haiku-webpositive-msvdx)),
+  엔진. GMA500이 있으면 하드웨어 H.264 디코더([haiku-webpositive-msvdx](https://github.com/rainygirl/renkuos-webpositive-msvdx)),
   없으면 ffmpeg 플러그인을 씁니다. 영상은 오디오 클록에 맞춰 내보내고, 드롭된
   프레임 수를 페이지에 보고합니다. WebM/VP9/AV1은 지원하지 않는다고 답해 사이트가
   H.264를 보내게 합니다.
@@ -53,7 +53,7 @@ VAIO P에서 원래 user agent로 측정한 결과입니다.
 
 `webkit/build-haikuwebkit-x86.sh`가 Linux에서 `haikuwebkit_x86` 1.9.19-22를
 크로스 빌드합니다.
-[haiku-rwebpositive-arm64](https://github.com/rainygirl/haiku-rwebpositive-arm64)의
+[haiku-rwebpositive-arm64](https://github.com/rainygirl/renkuos-rwebpositive-arm64)의
 x86 빌드(메모리 누수 수정)에 이 저장소의 패치 두 개를 얹어 실행하므로, `RWP`에 그
 체크아웃 경로를 지정하세요.
 
